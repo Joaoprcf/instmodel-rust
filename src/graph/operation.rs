@@ -41,6 +41,8 @@ pub enum Operation {
     Scale { id: OpId, vector: Vec<f32> },
     /// Element-wise add a fixed parameter vector.
     Shift { id: OpId, vector: Vec<f32> },
+    /// Batch normalization layer with trainable parameters.
+    BatchNorm { id: OpId, epsilon: f32 },
 }
 
 impl Operation {
@@ -89,6 +91,19 @@ impl Operation {
         }
     }
 
+    /// Creates a new BatchNorm operation with trainable parameters.
+    pub fn batch_norm(epsilon: f32) -> Self {
+        Self::BatchNorm {
+            id: next_op_id(),
+            epsilon,
+        }
+    }
+
+    /// Creates a new BatchNorm operation with default epsilon (1e-3).
+    pub fn batch_norm_default() -> Self {
+        Self::batch_norm(1e-3)
+    }
+
     /// Returns the unique ID of this operation.
     pub fn id(&self) -> OpId {
         match self {
@@ -99,6 +114,7 @@ impl Operation {
             Self::Softmax { id } => *id,
             Self::Scale { id, .. } => *id,
             Self::Shift { id, .. } => *id,
+            Self::BatchNorm { id, .. } => *id,
         }
     }
 
@@ -111,6 +127,7 @@ impl Operation {
             Self::Softmax { .. } => input_sizes[0],
             Self::Scale { vector, .. } => vector.len(),
             Self::Shift { vector, .. } => vector.len(),
+            Self::BatchNorm { .. } => input_sizes[0],
         }
     }
 
@@ -271,6 +288,37 @@ pub mod ops {
         );
         Operation::shift(vector).apply(input)
     }
+
+    /// Applies batch normalization to the input.
+    ///
+    /// During training, tracks running mean/variance. At export, converts to
+    /// element-wise ADD and MUL operations for efficient inference.
+    ///
+    /// # Example
+    /// ```
+    /// use instmodel::graph::{InputBuffer, ops};
+    ///
+    /// let input = InputBuffer::new(4);
+    /// let normalized = ops::batch_norm(input.buffer());
+    /// assert_eq!(normalized.size(), 4);
+    /// ```
+    pub fn batch_norm(input: DataBuffer) -> DataBuffer {
+        Operation::batch_norm_default().apply(input)
+    }
+
+    /// Applies batch normalization with custom epsilon.
+    ///
+    /// # Example
+    /// ```
+    /// use instmodel::graph::{InputBuffer, ops};
+    ///
+    /// let input = InputBuffer::new(4);
+    /// let normalized = ops::batch_norm_with_epsilon(1e-5, input.buffer());
+    /// assert_eq!(normalized.size(), 4);
+    /// ```
+    pub fn batch_norm_with_epsilon(epsilon: f32, input: DataBuffer) -> DataBuffer {
+        Operation::batch_norm(epsilon).apply(input)
+    }
 }
 
 impl Operation {
@@ -405,7 +453,67 @@ impl Operation {
 
                 output_index
             }
+            Self::BatchNorm { .. } => {
+                panic!(
+                    "BatchNorm must be compiled with compile_batch_norm to include trained parameters"
+                );
+            }
         }
+    }
+
+    /// Compiles BatchNorm operation with trained parameters.
+    /// Parameters: (center, std, beta) where:
+    /// - center = -running_mean
+    /// - std = gamma / sqrt(running_variance + epsilon)
+    /// - beta = learned bias
+    pub fn compile_batch_norm(
+        &self,
+        input_indices: &[usize],
+        ctx: &mut CompileContext,
+        center: &[f32],
+        std: &[f32],
+        beta: &[f32],
+    ) -> usize {
+        let Self::BatchNorm { id, .. } = self else {
+            panic!("compile_batch_norm called on non-BatchNorm operation");
+        };
+
+        let output_size = ctx.buffer_sizes[input_indices[0]];
+        let output_index = ctx.allocate_buffer(output_size);
+
+        // First copy input to output
+        let copy_instruction = InstructionExport::Copy {
+            input: input_indices[0],
+            output: output_index,
+            internal_index: 0,
+        };
+        ctx.add_instruction(copy_instruction);
+
+        // 1. ADD_ELEMENTWISE: x + center (i.e., x - mean)
+        let center_param_index = ctx.get_or_store_parameters(*id, center);
+        let center_instruction = InstructionExport::AddElementwise {
+            input: output_index,
+            parameters: center_param_index,
+        };
+        ctx.add_instruction(center_instruction);
+
+        // 2. MUL_ELEMENTWISE: x * std (i.e., x * gamma / sqrt(var + eps))
+        let std_param_index = ctx.get_or_store_parameters(*id + 1_000_000, std);
+        let mul_instruction = InstructionExport::MulElementwise {
+            input: output_index,
+            parameters: std_param_index,
+        };
+        ctx.add_instruction(mul_instruction);
+
+        // 3. ADD_ELEMENTWISE: x + beta
+        let beta_param_index = ctx.get_or_store_parameters(*id + 2_000_000, beta);
+        let beta_instruction = InstructionExport::AddElementwise {
+            input: output_index,
+            parameters: beta_param_index,
+        };
+        ctx.add_instruction(beta_instruction);
+
+        output_index
     }
 }
 

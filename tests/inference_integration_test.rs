@@ -922,3 +922,334 @@ fn test_scale_shift_combined_inference() {
         );
     }
 }
+
+// ==================== BatchNorm Tests ====================
+
+#[test]
+fn test_batch_norm_inference() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let normalized = ops::batch_norm(x);
+    let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    assert_eq!(burn_result.len(), inference_result.len());
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm inference mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+#[test]
+fn test_batch_norm_with_dense_inference() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let hidden = ops::dense(8, Activation::Relu, x);
+    let normalized = ops::batch_norm(hidden);
+    let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    assert_eq!(burn_result.len(), inference_result.len());
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm+Dense inference mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+#[test]
+fn test_batch_norm_multiple_inputs() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let normalized = ops::batch_norm(x);
+    let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    // Test with multiple different inputs to verify consistency
+    let test_inputs = vec![
+        vec![1.0f32, 2.0, 3.0, 4.0],
+        vec![0.0f32, 0.0, 0.0, 0.0],
+        vec![-1.0f32, -2.0, 3.0, -4.0],
+        vec![100.0f32, 200.0, 300.0, 400.0],
+        vec![0.001f32, 0.002, 0.003, 0.004],
+    ];
+
+    for inputs in test_inputs {
+        let input_tensor =
+            Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+        let burn_output = model.forward(input_tensor);
+        let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+        let inference_result = inference_model
+            .predict(&inputs)
+            .expect("Inference should succeed");
+
+        assert_eq!(burn_result.len(), inference_result.len());
+        for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+            assert!(
+                floats_close(*burn_val, *inference_val, TOLERANCE),
+                "BatchNorm inference mismatch for input {:?}: burn={}, inference={}",
+                inputs,
+                burn_val,
+                inference_val
+            );
+        }
+    }
+}
+
+#[test]
+fn test_batch_norm_preserves_output_for_initial_state() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    // For initial BatchNorm state (gamma=1, beta=0, mean=0, var=1):
+    // output = (x - 0) / sqrt(1 + eps) + 0 = x / sqrt(1 + eps)
+    // With eps=1e-3: output ≈ x * 0.9995
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let normalized = ops::batch_norm(x);
+    // Use identity-like output (just pass through the normalized values)
+    let output = ops::dense(4, Activation::None, normalized);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    // Verify both produce the same results
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm initial state mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+#[test]
+fn test_batch_norm_chained() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Test chaining: Dense -> BatchNorm -> Dense -> BatchNorm -> Dense
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let h1 = ops::dense(8, Activation::Relu, x);
+    let n1 = ops::batch_norm(h1);
+    let h2 = ops::dense(4, Activation::Relu, n1);
+    let n2 = ops::batch_norm(h2);
+    let output = ops::dense(1, Activation::Sigmoid, n2);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    assert_eq!(burn_result.len(), inference_result.len());
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Chained BatchNorm mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+#[test]
+fn test_batch_norm_with_residual() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Test BatchNorm in a residual connection: x + BatchNorm(Dense(x))
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let hidden = ops::dense(4, Activation::Relu, x.clone());
+    let normalized = ops::batch_norm(hidden);
+    let residual = ops::add(vec![x, normalized]);
+    let output = ops::dense(1, Activation::Sigmoid, residual);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    assert_eq!(burn_result.len(), inference_result.len());
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm residual mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+#[test]
+fn test_batch_norm_different_sizes() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Test BatchNorm with different feature sizes
+    for size in [2, 4, 8, 16, 32] {
+        let input = InputBuffer::new(size);
+        let x = input.buffer();
+        let normalized = ops::batch_norm(x);
+        let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+        let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+            .expect("Model creation should succeed");
+
+        let json = model
+            .export_to_instruction_model()
+            .expect("Export should succeed");
+
+        let model_info: InstructionModelInfo =
+            serde_json::from_str(&json).expect("JSON should be valid");
+        let inference_model =
+            InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+        let inputs: Vec<f32> = (0..size).map(|i| (i + 1) as f32).collect();
+        let input_tensor =
+            Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, size]);
+
+        let burn_output = model.forward(input_tensor);
+        let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+        let inference_result = inference_model
+            .predict(&inputs)
+            .expect("Inference should succeed");
+
+        assert_eq!(burn_result.len(), inference_result.len());
+        for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+            assert!(
+                floats_close(*burn_val, *inference_val, TOLERANCE),
+                "BatchNorm size {} mismatch: burn={}, inference={}",
+                size,
+                burn_val,
+                inference_val
+            );
+        }
+    }
+}
