@@ -374,12 +374,13 @@ impl Operation {
                 let mut offset = 0;
                 for &input_idx in input_indices {
                     let input_size = ctx.buffer_sizes[input_idx];
-                    let indexes: Vec<usize> = (offset..offset + input_size).collect();
 
-                    let instruction = InstructionExport::CopyMasked {
+                    // Use COPY with internal_index (like Python Concatenate)
+                    // This copies the entire input buffer to output at offset
+                    let instruction = InstructionExport::Copy {
                         input: input_idx,
                         output: output_index,
-                        indexes,
+                        internal_index: offset,
                     };
                     ctx.add_instruction(instruction);
 

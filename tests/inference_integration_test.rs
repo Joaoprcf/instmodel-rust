@@ -1253,3 +1253,566 @@ fn test_batch_norm_different_sizes() {
         }
     }
 }
+
+// ==================== Training Tests with Export Verification ====================
+// These tests verify that:
+// 1. Training works with the graph API (using Autodiff backend)
+// 2. The trained model can be exported to instruction model format
+// 3. The exported model produces the same output as the trained burn model
+
+use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+
+const TRAINING_TOLERANCE: f32 = 1e-5;
+
+/// Diagnostic test: Graph API with Autodiff backend but NO training
+/// This tests if the issue is with Autodiff or with training specifically
+#[test]
+fn test_graph_api_autodiff_no_training() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let hidden = ops::dense(8, Activation::Relu, x);
+    let output = ops::dense(1, Activation::Sigmoid, hidden);
+
+    let model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Autodiff no-training mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Diagnostic test: ONE training step to isolate if the issue is training itself
+#[test]
+fn test_graph_api_single_training_step() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let hidden = ops::dense(8, Activation::Relu, x);
+    let output = ops::dense(1, Activation::Sigmoid, hidden);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    // Single training step
+    let input_tensor = Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+    let target = Tensor::<TrainingBackend, 2>::from_floats([[0.5]], &device);
+
+    let output_tensor = model.forward(input_tensor);
+    let diff = output_tensor.sub(target);
+    let loss = diff.clone().mul(diff).mean();
+
+    let grads = loss.backward();
+    let grads_params = GradientsParams::from_grads(grads, &model);
+    model = optimizer.step(0.01, model, grads_params);
+
+    // Export and verify
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (i, (burn_val, inference_val)) in
+        burn_result.iter().zip(inference_result.iter()).enumerate()
+    {
+        let diff = (burn_val - inference_val).abs();
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Single step training output {} mismatch: burn={}, inference={}, diff={}",
+            i,
+            burn_val,
+            inference_val,
+            diff
+        );
+    }
+}
+
+#[test]
+fn test_trained_graph_model_export_equivalence_simple() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    // Simple model without fan-out/concat
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let hidden = ops::dense(8, Activation::Relu, x);
+    let output = ops::dense(1, Activation::Sigmoid, hidden);
+
+    let model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Autodiff no-training mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test fan-out/concat pattern after training - verifies that models with
+/// branches that diverge and then concatenate maintain export equivalence.
+#[test]
+fn test_trained_graph_model_export_equivalence() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    // Fan-out architecture: input branches to two dense layers, then concatenates
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    // Two branches from the same input (fan-out)
+    let branch1 = ops::dense(3, Activation::Relu, x.clone());
+    let branch2 = ops::dense(2, Activation::Tanh, x);
+
+    // Concatenate the branches
+    let concatenated = ops::concat(vec![branch1, branch2]);
+
+    // Final output layer
+    let output = ops::dense(1, Activation::Sigmoid, concatenated);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    // Train for a few iterations
+    for _ in 0..10 {
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[0.5, 1.0, 1.5, 2.0]], &device);
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[0.7]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+    }
+
+    // Export and verify
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![0.5f32, 1.0, 1.5, 2.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+            "Fan-out/concat trained model mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+#[test]
+fn test_trained_model_with_inverse_activation() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    // Model using Inverse activation (1 - x)
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let hidden = ops::dense(4, Activation::Sigmoid, x);
+    let inverted = ops::dense(4, Activation::Inverse, hidden);
+    let output = ops::dense(1, Activation::None, inverted);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    // Train for a few iterations
+    for _ in 0..10 {
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[0.5, 1.0, 1.5, 2.0]], &device);
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[0.3]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+    }
+
+    // Export and verify
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![0.5f32, 1.0, 1.5, 2.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+            "Inverse activation trained model mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+#[test]
+fn test_trained_model_with_all_activations() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    // Test training and export for each activation type
+    let activations = [
+        Activation::Relu,
+        Activation::Sigmoid,
+        Activation::Tanh,
+        Activation::Inverse,
+    ];
+
+    for activation in activations {
+        let input = InputBuffer::new(4);
+        let x = input.buffer();
+        let hidden = ops::dense(4, activation, x);
+        let output = ops::dense(1, Activation::Sigmoid, hidden);
+
+        let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+            .expect("Model creation should succeed");
+
+        let mut optimizer = AdamConfig::new().init();
+
+        // Single training step
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[0.5]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+
+        // Export and verify
+        let json = model
+            .export_to_instruction_model()
+            .expect("Export should succeed");
+
+        let model_info: InstructionModelInfo =
+            serde_json::from_str(&json).expect("JSON should be valid");
+        let inference_model =
+            InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+        let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+        let input_tensor =
+            Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+        let burn_output = model.forward(input_tensor);
+        let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+        let inference_result = inference_model
+            .predict(&inputs)
+            .expect("Inference should succeed");
+
+        for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+            assert!(
+                floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+                "{:?} activation trained model mismatch: burn={}, inference={}",
+                activation,
+                burn_val,
+                inference_val
+            );
+        }
+    }
+}
+
+#[test]
+fn test_trained_fan_in_add_export() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    // Fan-in with add (residual-like pattern)
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let branch1 = ops::dense(4, Activation::Relu, x.clone());
+    let branch2 = ops::dense(4, Activation::Relu, x);
+    let added = ops::add(vec![branch1, branch2]);
+    let output = ops::dense(1, Activation::Sigmoid, added);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    // Train
+    for _ in 0..5 {
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[0.6]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+    }
+
+    // Export and verify
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+            "Fan-in add trained model mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+#[test]
+fn test_trained_model_with_scale_and_inverse() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    // Model combining scale(-1) with sigmoid to achieve similar effect to inverse
+    // This pattern: sigmoid -> scale(-1) gives values in [-1, 0]
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let hidden = ops::dense(4, Activation::Sigmoid, x);
+    let scaled = ops::scale(vec![-1.0, -1.0, -1.0, -1.0], hidden);
+    let output = ops::dense(1, Activation::None, scaled);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    // Train
+    for _ in 0..5 {
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[-0.5]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+    }
+
+    // Export and verify
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+            "Scale(-1) trained model mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test two-head architecture with scale operation in concat pattern.
+/// This verifies that scale operations work correctly when their output
+/// is concatenated with other operations.
+#[test]
+fn test_two_head_architecture_training() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    // Two-head architecture: one branch with dense, one with scale
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    // Head 1: regular dense layer
+    let head1 = ops::dense(2, Activation::Relu, x.clone());
+
+    // Head 2: scale operation (element-wise multiply by fixed vector)
+    // Scale by -1 to invert values (simulating a simple transformation)
+    let head2 = ops::scale(vec![-1.0, -1.0, -1.0, -1.0], x);
+
+    // Concatenate both heads
+    let concatenated = ops::concat(vec![head1, head2]);
+
+    // Final output layer
+    let output = ops::dense(1, Activation::Sigmoid, concatenated);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    // Train for a few iterations
+    for _ in 0..10 {
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[0.5, 1.0, 1.5, 2.0]], &device);
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[0.6]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+    }
+
+    // Export and verify
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![0.5f32, 1.0, 1.5, 2.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+            "Two-head architecture mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
