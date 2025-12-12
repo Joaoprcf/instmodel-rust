@@ -70,15 +70,26 @@ impl<B: Backend> DenseLayer<B> {
 }
 
 /// Initialized BatchNorm layer with Burn's BatchNorm module.
+/// Supports optional center (beta) and scale (gamma) parameters.
 #[derive(Module, Debug)]
 struct BatchNormLayer<B: Backend> {
-    batch_norm: BatchNorm<B, 1>,
+    batch_norm: BatchNorm<B>,
     num_features: usize,
     epsilon: f32,
+    #[module(ignore)]
+    center: Ignored<bool>,
+    #[module(ignore)]
+    scale: Ignored<bool>,
 }
 
 impl<B: Backend> BatchNormLayer<B> {
-    fn new(num_features: usize, epsilon: f32, device: &B::Device) -> Self {
+    fn new(
+        num_features: usize,
+        epsilon: f32,
+        center: bool,
+        scale: bool,
+        device: &B::Device,
+    ) -> Self {
         let batch_norm = BatchNormConfig::new(num_features)
             .with_epsilon(epsilon as f64)
             .init(device);
@@ -86,14 +97,44 @@ impl<B: Backend> BatchNormLayer<B> {
             batch_norm,
             num_features,
             epsilon,
+            center: Ignored(center),
+            scale: Ignored(scale),
         }
     }
 
     fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let [batch, features] = input.dims();
-        let input_3d = input.reshape([batch, features, 1]);
-        let output_3d = self.batch_norm.forward(input_3d);
-        output_3d.reshape([batch, features])
+        let [_batch, features] = input.dims();
+        let device = input.device();
+
+        // Get running stats
+        let running_mean = self.batch_norm.running_mean.value();
+        let running_var = self.batch_norm.running_var.value();
+
+        // Normalize: (x - mean) / sqrt(var + eps)
+        let mean_2d = running_mean.clone().reshape([1, features]);
+        let var_2d = running_var.clone().reshape([1, features]);
+        let eps = Tensor::<B, 2>::full([1, features], self.epsilon as f64, &device);
+        let std = (var_2d + eps).sqrt();
+
+        let normalized = (input - mean_2d) / std;
+
+        // Apply gamma (scale) if enabled
+        let scaled = if self.scale.0 {
+            let gamma = self.batch_norm.gamma.val();
+            let gamma_2d = gamma.reshape([1, features]);
+            normalized * gamma_2d
+        } else {
+            normalized
+        };
+
+        // Apply beta (center/shift) if enabled
+        if self.center.0 {
+            let beta = self.batch_norm.beta.val();
+            let beta_2d = beta.reshape([1, features]);
+            scaled + beta_2d
+        } else {
+            scaled
+        }
     }
 
     fn get_normalization_params(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -119,14 +160,28 @@ impl<B: Backend> BatchNormLayer<B> {
         // center = -moving_mean
         let center: Vec<f32> = running_mean.iter().map(|m| -m).collect();
 
-        // std = gamma / sqrt(variance + epsilon)
-        let std: Vec<f32> = gamma
-            .iter()
-            .zip(running_var.iter())
-            .map(|(g, v)| g / (v + epsilon).sqrt())
-            .collect();
+        // std = gamma / sqrt(variance + epsilon) if scale enabled, else 1/sqrt(var+eps)
+        let std: Vec<f32> = if self.scale.0 {
+            gamma
+                .iter()
+                .zip(running_var.iter())
+                .map(|(g, v)| g / (v + epsilon).sqrt())
+                .collect()
+        } else {
+            running_var
+                .iter()
+                .map(|v| 1.0 / (v + epsilon).sqrt())
+                .collect()
+        };
 
-        (center, std, beta)
+        // beta = learned beta if center enabled, else zeros
+        let beta_out: Vec<f32> = if self.center.0 {
+            beta
+        } else {
+            vec![0.0; self.num_features]
+        };
+
+        (center, std, beta_out)
     }
 }
 
@@ -223,8 +278,8 @@ impl<B: Backend> ModelGraph<B> {
 
         builder.traverse(&output)?;
 
-        let (dense_layers, dense_op_ids) = builder.init_dense_layers(device);
-        let (batch_norm_layers, batch_norm_op_ids) = builder.init_batch_norm_layers(device);
+        let (dense_layers, dense_op_ids) = builder.init_dense_layers::<B>(device);
+        let (batch_norm_layers, batch_norm_op_ids) = builder.init_batch_norm_layers::<B>(device);
 
         let features: Vec<String> = inputs
             .iter()
@@ -457,8 +512,8 @@ struct GraphBuilder {
     steps: Vec<Step>,
     /// Maps OpId -> (input_size, output_size, activation, layer_index)
     dense_info: HashMap<OpId, (usize, usize, Activation, usize)>,
-    /// Maps OpId -> (num_features, epsilon, layer_index)
-    batch_norm_info: HashMap<OpId, (usize, f32, usize)>,
+    /// Maps OpId -> (num_features, epsilon, center, scale, layer_index)
+    batch_norm_info: HashMap<OpId, (usize, f32, bool, bool, usize)>,
     visited: HashMap<BufferId, bool>,
     next_dense_index: usize,
     next_batch_norm_index: usize,
@@ -567,13 +622,18 @@ impl GraphBuilder {
                     vector: vector.clone(),
                 });
             }
-            Operation::BatchNorm { id, epsilon, .. } => {
-                let layer_index = if let Some((_, _, idx)) = self.batch_norm_info.get(id) {
+            Operation::BatchNorm {
+                id,
+                epsilon,
+                center,
+                scale,
+            } => {
+                let layer_index = if let Some((_, _, _, _, idx)) = self.batch_norm_info.get(id) {
                     *idx
                 } else {
                     let idx = self.next_batch_norm_index;
                     self.batch_norm_info
-                        .insert(*id, (input_size, *epsilon, idx));
+                        .insert(*id, (input_size, *epsilon, *center, *scale, idx));
                     self.next_batch_norm_index += 1;
                     idx
                 };
@@ -624,13 +684,15 @@ impl GraphBuilder {
         let mut layers: Vec<(usize, OpId, BatchNormLayer<B>)> = self
             .batch_norm_info
             .iter()
-            .map(|(&op_id, &(num_features, epsilon, layer_index))| {
-                (
-                    layer_index,
-                    op_id,
-                    BatchNormLayer::new(num_features, epsilon, device),
-                )
-            })
+            .map(
+                |(&op_id, &(num_features, epsilon, center, scale, layer_index))| {
+                    (
+                        layer_index,
+                        op_id,
+                        BatchNormLayer::new(num_features, epsilon, center, scale, device),
+                    )
+                },
+            )
             .collect();
 
         // Sort by layer index to ensure correct ordering
@@ -997,7 +1059,7 @@ mod tests {
 
         let device = <TestBackend as Backend>::Device::default();
         let epsilon = 1e-3f32;
-        let layer = BatchNormLayer::<TestBackend>::new(4, epsilon, &device);
+        let layer = BatchNormLayer::<TestBackend>::new(4, epsilon, true, true, &device);
 
         let (center, std, beta) = layer.get_normalization_params();
 
@@ -1040,7 +1102,7 @@ mod tests {
 
         let device = <TestBackend as Backend>::Device::default();
         let epsilon = 1e-3f32;
-        let layer = BatchNormLayer::<TestBackend>::new(4, epsilon, &device);
+        let layer = BatchNormLayer::<TestBackend>::new(4, epsilon, true, true, &device);
 
         // With initial state (gamma=1, beta=0, mean=0, var=1):
         // output = gamma * (x - mean) / sqrt(var + eps) + beta

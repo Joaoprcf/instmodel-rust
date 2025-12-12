@@ -1742,6 +1742,749 @@ fn test_trained_model_with_scale_and_inverse() {
     }
 }
 
+// ==================== Fan-in/Fan-out with Multiply Tests ====================
+
+/// Test fan-out pattern with multiply gating (Swish-like)
+#[test]
+fn test_fan_out_multiply_gating() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Fan-out pattern: input -> two branches -> multiply (gating mechanism)
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    // Two branches that will be multiplied together (like Swish: x * sigmoid(x))
+    let linear_branch = ops::dense(4, Activation::None, x.clone());
+    let gate_branch = ops::dense(4, Activation::Sigmoid, x);
+    let gated = ops::multiply(vec![linear_branch, gate_branch]);
+
+    let output = ops::dense(1, Activation::Sigmoid, gated);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let test_inputs = vec![
+        vec![1.0f32, 2.0, 3.0, 4.0],
+        vec![-1.0f32, 0.5, -0.5, 1.0],
+        vec![0.0f32, 0.0, 0.0, 0.0],
+    ];
+
+    for inputs in test_inputs {
+        let input_tensor =
+            Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+        let burn_output = model.forward(input_tensor);
+        let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+        let inference_result = inference_model
+            .predict(&inputs)
+            .expect("Inference should succeed");
+
+        for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+            assert!(
+                floats_close(*burn_val, *inference_val, TOLERANCE),
+                "Fan-out multiply gating mismatch for {:?}: burn={}, inference={}",
+                inputs,
+                burn_val,
+                inference_val
+            );
+        }
+    }
+}
+
+/// Test fan-in with multiply (element-wise product of two branches)
+#[test]
+fn test_fan_in_multiply() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    let branch1 = ops::dense(4, Activation::Relu, x.clone());
+    let branch2 = ops::dense(4, Activation::Sigmoid, x);
+    let multiplied = ops::multiply(vec![branch1, branch2]);
+
+    let output = ops::dense(1, Activation::None, multiplied);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Fan-in multiply mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test triple fan-out with multiply (three branches multiplied together)
+#[test]
+fn test_triple_fan_out_multiply() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    let branch1 = ops::dense(4, Activation::Relu, x.clone());
+    let branch2 = ops::dense(4, Activation::Sigmoid, x.clone());
+    let branch3 = ops::dense(4, Activation::Tanh, x);
+
+    let multiplied = ops::multiply(vec![branch1, branch2, branch3]);
+    let output = ops::dense(1, Activation::Sigmoid, multiplied);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![0.5f32, 1.0, -0.5, 0.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Triple fan-out multiply mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test two-head architecture with multiply gating and concat
+#[test]
+fn test_two_head_multiply_concat() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let hidden = ops::dense(8, Activation::Relu, x);
+
+    // Head 1: Swish-like gating (x * sigmoid(x))
+    let head1_linear = ops::dense(1, Activation::None, hidden.clone());
+    let head1_gate = ops::dense(1, Activation::Sigmoid, hidden.clone());
+    let head1 = ops::multiply(vec![head1_linear, head1_gate]);
+
+    // Head 2: Negative Swish-like gating (-(x * sigmoid(x)))
+    let head2_linear = ops::dense(1, Activation::None, hidden.clone());
+    let head2_gate = ops::dense(1, Activation::Sigmoid, hidden);
+    let head2_raw = ops::multiply(vec![head2_linear, head2_gate]);
+    let head2 = ops::scale(vec![-1.0], head2_raw);
+
+    let output = ops::concat(vec![head1, head2]);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    assert_eq!(burn_result.len(), 2);
+    assert_eq!(inference_result.len(), 2);
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Two-head multiply concat mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+// ==================== BatchNorm with All Settings Tests ====================
+
+/// Test BatchNorm with scale only (center=false, scale=true)
+#[test]
+fn test_batch_norm_scale_only() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let normalized = ops::batch_norm_scale_only(x);
+    let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let test_inputs = vec![
+        vec![1.0f32, 2.0, 3.0, 4.0],
+        vec![-1.0f32, -2.0, 3.0, -4.0],
+        vec![0.0f32, 0.0, 0.0, 0.0],
+    ];
+
+    for inputs in test_inputs {
+        let input_tensor =
+            Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+        let burn_output = model.forward(input_tensor);
+        let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+        let inference_result = inference_model
+            .predict(&inputs)
+            .expect("Inference should succeed");
+
+        for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+            assert!(
+                floats_close(*burn_val, *inference_val, TOLERANCE),
+                "BatchNorm scale-only mismatch for {:?}: burn={}, inference={}",
+                inputs,
+                burn_val,
+                inference_val
+            );
+        }
+    }
+}
+
+/// Test BatchNorm with full config (center=true, scale=true) - default
+#[test]
+fn test_batch_norm_full_config() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    // Full batch norm: center=true, scale=true (default)
+    let normalized = ops::batch_norm_config(1e-3, true, true, x);
+    let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm full config mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test BatchNorm with center only (center=true, scale=false)
+#[test]
+fn test_batch_norm_center_only() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    // Center only: center=true, scale=false
+    let normalized = ops::batch_norm_config(1e-3, true, false, x);
+    let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm center-only mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test BatchNorm with neither center nor scale (center=false, scale=false)
+#[test]
+fn test_batch_norm_neither() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    // Neither: center=false, scale=false (just variance normalization)
+    let normalized = ops::batch_norm_config(1e-3, false, false, x);
+    let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm neither mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test BatchNorm scale-only with different epsilon values
+#[test]
+fn test_batch_norm_scale_only_different_epsilons() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    for epsilon in [1e-5, 1e-3, 1e-1] {
+        let input = InputBuffer::new(4);
+        let x = input.buffer();
+        let normalized = ops::batch_norm_config(epsilon, false, true, x);
+        let output = ops::dense(1, Activation::Sigmoid, normalized);
+
+        let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+            .expect("Model creation should succeed");
+
+        let json = model
+            .export_to_instruction_model()
+            .expect("Export should succeed");
+
+        let model_info: InstructionModelInfo =
+            serde_json::from_str(&json).expect("JSON should be valid");
+        let inference_model =
+            InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+        let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+        let input_tensor =
+            Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+        let burn_output = model.forward(input_tensor);
+        let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+        let inference_result = inference_model
+            .predict(&inputs)
+            .expect("Inference should succeed");
+
+        for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+            assert!(
+                floats_close(*burn_val, *inference_val, TOLERANCE),
+                "BatchNorm scale-only epsilon {} mismatch: burn={}, inference={}",
+                epsilon,
+                burn_val,
+                inference_val
+            );
+        }
+    }
+}
+
+/// Test BatchNorm scale-only with dense layers before and after
+#[test]
+fn test_batch_norm_scale_only_with_dense() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let normalized = ops::batch_norm_scale_only(x);
+    let hidden = ops::dense(8, Activation::Relu, normalized);
+    let output = ops::dense(1, Activation::Sigmoid, hidden);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm scale-only with dense mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test BatchNorm with multiply gating pattern
+#[test]
+fn test_batch_norm_with_multiply_gating() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    // Input normalization (scale only)
+    let normalized = ops::batch_norm_scale_only(x);
+
+    // Hidden layer
+    let hidden = ops::dense(8, Activation::Relu, normalized);
+
+    // Swish-like gating with normalized input
+    let linear = ops::dense(1, Activation::None, hidden.clone());
+    let gate = ops::dense(1, Activation::Sigmoid, hidden);
+    let output = ops::multiply(vec![linear, gate]);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "BatchNorm with multiply gating mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+// ==================== Training Tests with Multiply and BatchNorm ====================
+
+/// Test trained model with fan-out multiply pattern
+#[test]
+fn test_trained_fan_out_multiply() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    let linear_branch = ops::dense(4, Activation::None, x.clone());
+    let gate_branch = ops::dense(4, Activation::Sigmoid, x);
+    let gated = ops::multiply(vec![linear_branch, gate_branch]);
+    let output = ops::dense(1, Activation::Sigmoid, gated);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    for _ in 0..10 {
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[0.7]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+    }
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+            "Trained fan-out multiply mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test trained model with BatchNorm scale-only
+#[test]
+fn test_trained_batch_norm_scale_only() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let normalized = ops::batch_norm_scale_only(x);
+    let hidden = ops::dense(8, Activation::Relu, normalized);
+    let output = ops::dense(1, Activation::Sigmoid, hidden);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    for _ in 0..10 {
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[0.5]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+    }
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+            "Trained BatchNorm scale-only mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test trained model with full architecture: BatchNorm + multiply gating + two heads
+#[test]
+fn test_trained_full_architecture() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    // Input normalization (scale only)
+    let normalized = ops::batch_norm_scale_only(x);
+
+    // Shared hidden layer
+    let hidden = ops::dense(8, Activation::Relu, normalized);
+
+    // Head 1: Swish-like (x * sigmoid(x))
+    let head1_linear = ops::dense(1, Activation::None, hidden.clone());
+    let head1_gate = ops::dense(1, Activation::Sigmoid, hidden.clone());
+    let head1 = ops::multiply(vec![head1_linear, head1_gate]);
+
+    // Head 2: Negative Swish-like (-(x * sigmoid(x)))
+    let head2_linear = ops::dense(1, Activation::None, hidden.clone());
+    let head2_gate = ops::dense(1, Activation::Sigmoid, hidden);
+    let head2_raw = ops::multiply(vec![head2_linear, head2_gate]);
+    let head2 = ops::scale(vec![-1.0], head2_raw);
+
+    let output = ops::concat(vec![head1, head2]);
+
+    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let mut optimizer = AdamConfig::new().init();
+
+    for _ in 0..10 {
+        let input_tensor =
+            Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+        // Target: [upside, downside]
+        let target = Tensor::<TrainingBackend, 2>::from_floats([[0.3, -0.2]], &device);
+
+        let output_tensor = model.forward(input_tensor);
+        let diff = output_tensor.sub(target);
+        let loss = diff.clone().mul(diff).mean();
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(0.01, model, grads_params);
+    }
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input_tensor =
+        Tensor::<TrainingBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.into_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    assert_eq!(burn_result.len(), 2);
+    assert_eq!(inference_result.len(), 2);
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TRAINING_TOLERANCE),
+            "Trained full architecture mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
 /// Test two-head architecture with scale operation in concat pattern.
 /// This verifies that scale operations work correctly when their output
 /// is concatenated with other operations.

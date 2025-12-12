@@ -42,7 +42,14 @@ pub enum Operation {
     /// Element-wise add a fixed parameter vector.
     Shift { id: OpId, vector: Vec<f32> },
     /// Batch normalization layer with trainable parameters.
-    BatchNorm { id: OpId, epsilon: f32 },
+    /// - center: if true, learn beta (bias); if false, beta=0
+    /// - scale: if true, learn gamma; if false, gamma=1
+    BatchNorm {
+        id: OpId,
+        epsilon: f32,
+        center: bool,
+        scale: bool,
+    },
 }
 
 impl Operation {
@@ -92,16 +99,25 @@ impl Operation {
     }
 
     /// Creates a new BatchNorm operation with trainable parameters.
-    pub fn batch_norm(epsilon: f32) -> Self {
+    /// - center: if true, learn beta; if false, beta=0
+    /// - scale: if true, learn gamma; if false, gamma=1
+    pub fn batch_norm(epsilon: f32, center: bool, scale: bool) -> Self {
         Self::BatchNorm {
             id: next_op_id(),
             epsilon,
+            center,
+            scale,
         }
     }
 
-    /// Creates a new BatchNorm operation with default epsilon (1e-3).
+    /// Creates a new BatchNorm operation with default epsilon (1e-3) and both center and scale enabled.
     pub fn batch_norm_default() -> Self {
-        Self::batch_norm(1e-3)
+        Self::batch_norm(1e-3, true, true)
+    }
+
+    /// Creates a new BatchNorm operation with scale only (no centering beta).
+    pub fn batch_norm_scale_only(epsilon: f32) -> Self {
+        Self::batch_norm(epsilon, false, true)
     }
 
     /// Returns the unique ID of this operation.
@@ -289,7 +305,7 @@ pub mod ops {
         Operation::shift(vector).apply(input)
     }
 
-    /// Applies batch normalization to the input.
+    /// Applies batch normalization to the input (with center and scale enabled).
     ///
     /// During training, tracks running mean/variance. At export, converts to
     /// element-wise ADD and MUL operations for efficient inference.
@@ -306,7 +322,7 @@ pub mod ops {
         Operation::batch_norm_default().apply(input)
     }
 
-    /// Applies batch normalization with custom epsilon.
+    /// Applies batch normalization with custom epsilon (with center and scale enabled).
     ///
     /// # Example
     /// ```
@@ -317,7 +333,49 @@ pub mod ops {
     /// assert_eq!(normalized.size(), 4);
     /// ```
     pub fn batch_norm_with_epsilon(epsilon: f32, input: DataBuffer) -> DataBuffer {
-        Operation::batch_norm(epsilon).apply(input)
+        Operation::batch_norm(epsilon, true, true).apply(input)
+    }
+
+    /// Applies batch normalization with scale only (no learnable beta/center).
+    ///
+    /// Learns gamma (scale) per feature but sets beta=0.
+    /// Formula: output = gamma * (x - mean) / sqrt(var + eps)
+    ///
+    /// # Example
+    /// ```
+    /// use instmodel::graph::{InputBuffer, ops};
+    ///
+    /// let input = InputBuffer::new(4);
+    /// let normalized = ops::batch_norm_scale_only(input.buffer());
+    /// assert_eq!(normalized.size(), 4);
+    /// ```
+    pub fn batch_norm_scale_only(input: DataBuffer) -> DataBuffer {
+        Operation::batch_norm_scale_only(1e-3).apply(input)
+    }
+
+    /// Applies batch normalization with full configuration.
+    ///
+    /// # Arguments
+    /// * `epsilon` - Numerical stability constant
+    /// * `center` - If true, learn beta (bias); if false, beta=0
+    /// * `scale` - If true, learn gamma; if false, gamma=1
+    ///
+    /// # Example
+    /// ```
+    /// use instmodel::graph::{InputBuffer, ops};
+    ///
+    /// let input = InputBuffer::new(4);
+    /// // Scale only, no center
+    /// let normalized = ops::batch_norm_config(1e-5, false, true, input.buffer());
+    /// assert_eq!(normalized.size(), 4);
+    /// ```
+    pub fn batch_norm_config(
+        epsilon: f32,
+        center: bool,
+        scale: bool,
+        input: DataBuffer,
+    ) -> DataBuffer {
+        Operation::batch_norm(epsilon, center, scale).apply(input)
     }
 }
 

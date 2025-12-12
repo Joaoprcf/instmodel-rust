@@ -1,6 +1,6 @@
 [package]
 name = "instmodel"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "Instruction-based neural network model training library using Burn"
@@ -11,7 +11,7 @@ categories = ["science", "mathematics"]
 
 [dependencies]
 # Burn framework with WGPU backend (no external dependencies)
-burn = { version = "0.16", features = ["wgpu", "autodiff", "train", "ndarray"] }
+burn = { version = "0.19", features = ["wgpu", "autodiff", "train", "ndarray"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
