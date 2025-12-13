@@ -13,7 +13,7 @@ use instmodel_inference::{InstructionModel, InstructionModelInfo};
 type TestBackend = NdArray;
 type TrainingBackend = Autodiff<NdArray>;
 
-const TOLERANCE: f32 = 1e-5;
+const TOLERANCE: f32 = 1e-6;
 
 fn floats_close(a: f32, b: f32, tolerance: f32) -> bool {
     (a - b).abs() < tolerance
@@ -2556,6 +2556,957 @@ fn test_two_head_architecture_training() {
             "Two-head architecture mismatch: burn={}, inference={}",
             burn_val,
             inference_val
+        );
+    }
+}
+
+/// Tests nested model structure - a sub-model applied multiple times with shared weights.
+/// This clones Python's test_nested_model from instmodel.
+#[test]
+fn test_nested_model() {
+    use instmodel::graph::InstructionExport;
+
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Build sub-model: BatchNorm + Dense(3) + Dense(3)
+    // Equivalent to Python: ff_model([3, 3, 3], NOT_INPLACE, "ll")
+    let sub_input = InputBuffer::new(3);
+    let normalized = ops::batch_norm(sub_input.buffer());
+    let hidden = ops::dense(3, Activation::None, normalized);
+    let sub_output = ops::dense(3, Activation::None, hidden);
+    let sub_model = GraphModel::<TestBackend>::new(vec![sub_input], sub_output, &device)
+        .expect("Sub-model creation should succeed");
+
+    // === Test 1: Export sub-model independently ===
+    let sub_export = sub_model.to_instruction_model_info();
+    assert_eq!(
+        sub_export.buffer_sizes,
+        vec![3, 3, 3, 3],
+        "Sub-model buffer sizes: [input=3, bn_out=3, dense1=3, dense2=3]"
+    );
+    assert_eq!(sub_export.weights.len(), 2, "Sub-model has 2 Dense layers");
+    assert_eq!(
+        sub_export.parameters.len(),
+        3,
+        "Sub-model has 3 BatchNorm parameters"
+    );
+
+    // === Test 2: Build and export final model ===
+    let main_input = InputBuffer::new(3);
+    let first_iteration = sub_model.apply_single(main_input.buffer());
+    let second_iteration = sub_model.apply_single(first_iteration.clone());
+
+    let concat = ops::concat(vec![main_input.buffer(), first_iteration, second_iteration]);
+    let final_output = ops::dense(1, Activation::None, concat);
+
+    let final_model = GraphModel::<TestBackend>::new(vec![main_input], final_output, &device)
+        .expect("Final model creation should succeed");
+
+    // Test forward pass
+    let input = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0]], &device);
+    let output = final_model.forward(input);
+    assert_eq!(output.dims(), [1, 1]);
+
+    let export = final_model.to_instruction_model_info();
+
+    // === Test 3: Validate buffer sizes ===
+    assert_eq!(
+        export.buffer_sizes,
+        vec![3, 3, 3, 3, 3, 3, 3, 9, 1],
+        "Buffer sizes should match: [input, bn1, d1, d2, bn2, d3, d4, concat, out]"
+    );
+
+    // === Test 4: Validate weight count and sharing ===
+    assert_eq!(
+        export.weights.len(),
+        3,
+        "Should have 3 weight sets (2 from sub-model + 1 final)"
+    );
+
+    // === Test 5: Validate parameter count and sharing ===
+    assert_eq!(
+        export.parameters.len(),
+        3,
+        "Should have 3 parameter vectors (BatchNorm: center, std, beta) - SHARED"
+    );
+
+    // === Test 6: Validate exact instruction sequence (matches Python test_nested_model) ===
+    // Python expected:
+    // COPY 0→1, ADD 1 p0, MUL 1 p1, ADD 1 p2, DOT 1→2 w0, DOT 2→3 w1,
+    // COPY 3→4, ADD 4 p0, MUL 4 p1, ADD 4 p2, DOT 4→5 w0, DOT 5→6 w1,
+    // COPY 0→7 idx0, COPY 3→7 idx3, COPY 6→7 idx6, DOT 7→8 w2
+    assert_eq!(
+        export.instructions.len(),
+        16,
+        "Should have 16 instructions total"
+    );
+
+    // Verify instruction sequence matches Python exactly
+    let expected_instructions: Vec<(
+        &str,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+    )> = vec![
+        // First sub-model application (BatchNorm + 2 Dense)
+        ("COPY", Some(0), Some(1), None, Some(0)), // COPY 0→1, internal_index 0
+        ("ADD_ELEMENTWISE", Some(1), None, Some(0), None), // ADD input=1, params=0
+        ("MUL_ELEMENTWISE", Some(1), None, Some(1), None), // MUL input=1, params=1
+        ("ADD_ELEMENTWISE", Some(1), None, Some(2), None), // ADD input=1, params=2
+        ("DOT", Some(1), Some(2), None, None),     // DOT 1→2, weights 0
+        ("DOT", Some(2), Some(3), None, None),     // DOT 2→3, weights 1
+        // Second sub-model application (BatchNorm + 2 Dense) - SHARED params/weights!
+        ("COPY", Some(3), Some(4), None, Some(0)), // COPY 3→4, internal_index 0
+        ("ADD_ELEMENTWISE", Some(4), None, Some(0), None), // ADD input=4, params=0 (SHARED)
+        ("MUL_ELEMENTWISE", Some(4), None, Some(1), None), // MUL input=4, params=1 (SHARED)
+        ("ADD_ELEMENTWISE", Some(4), None, Some(2), None), // ADD input=4, params=2 (SHARED)
+        ("DOT", Some(4), Some(5), None, None),     // DOT 4→5, weights 0 (SHARED)
+        ("DOT", Some(5), Some(6), None, None),     // DOT 5→6, weights 1 (SHARED)
+        // Concatenate
+        ("COPY", Some(0), Some(7), None, Some(0)), // COPY 0→7, internal_index 0
+        ("COPY", Some(3), Some(7), None, Some(3)), // COPY 3→7, internal_index 3
+        ("COPY", Some(6), Some(7), None, Some(6)), // COPY 6→7, internal_index 6
+        // Final Dense
+        ("DOT", Some(7), Some(8), None, None), // DOT 7→8, weights 2
+    ];
+
+    for (i, (expected_type, expected_input, expected_output, expected_params, expected_internal)) in
+        expected_instructions.iter().enumerate()
+    {
+        let instr = &export.instructions[i];
+        match instr {
+            InstructionExport::Copy {
+                input,
+                output,
+                internal_index,
+            } => {
+                assert_eq!(*expected_type, "COPY", "Instruction {} type mismatch", i);
+                assert_eq!(
+                    Some(*input),
+                    *expected_input,
+                    "Instruction {} COPY input mismatch",
+                    i
+                );
+                assert_eq!(
+                    Some(*output),
+                    *expected_output,
+                    "Instruction {} COPY output mismatch",
+                    i
+                );
+                assert_eq!(
+                    Some(*internal_index),
+                    *expected_internal,
+                    "Instruction {} COPY internal_index mismatch",
+                    i
+                );
+            }
+            InstructionExport::AddElementwise { input, parameters } => {
+                assert_eq!(
+                    *expected_type, "ADD_ELEMENTWISE",
+                    "Instruction {} type mismatch",
+                    i
+                );
+                assert_eq!(
+                    Some(*input),
+                    *expected_input,
+                    "Instruction {} ADD input mismatch",
+                    i
+                );
+                assert_eq!(
+                    Some(*parameters),
+                    *expected_params,
+                    "Instruction {} ADD parameters mismatch",
+                    i
+                );
+            }
+            InstructionExport::MulElementwise { input, parameters } => {
+                assert_eq!(
+                    *expected_type, "MUL_ELEMENTWISE",
+                    "Instruction {} type mismatch",
+                    i
+                );
+                assert_eq!(
+                    Some(*input),
+                    *expected_input,
+                    "Instruction {} MUL input mismatch",
+                    i
+                );
+                assert_eq!(
+                    Some(*parameters),
+                    *expected_params,
+                    "Instruction {} MUL parameters mismatch",
+                    i
+                );
+            }
+            InstructionExport::Dot {
+                input,
+                output,
+                weights,
+                ..
+            } => {
+                assert_eq!(*expected_type, "DOT", "Instruction {} type mismatch", i);
+                assert_eq!(
+                    Some(*input),
+                    *expected_input,
+                    "Instruction {} DOT input mismatch",
+                    i
+                );
+                assert_eq!(
+                    Some(*output),
+                    *expected_output,
+                    "Instruction {} DOT output mismatch",
+                    i
+                );
+                // Validate weight indices for DOT instructions
+                let expected_weights = match i {
+                    4 | 10 => 0, // First dense in both sub-model applications
+                    5 | 11 => 1, // Second dense in both sub-model applications
+                    15 => 2,     // Final dense
+                    _ => panic!("Unexpected DOT instruction at index {}", i),
+                };
+                assert_eq!(
+                    *weights, expected_weights,
+                    "Instruction {} DOT weights mismatch",
+                    i
+                );
+            }
+            _ => panic!("Unexpected instruction type at index {}: {:?}", i, instr),
+        }
+    }
+
+    // === Test 7: Verify weight sharing explicitly ===
+    let mut weight_usage = std::collections::HashMap::new();
+    for instr in &export.instructions {
+        if let InstructionExport::Dot { weights, .. } = instr {
+            *weight_usage.entry(*weights).or_insert(0) += 1;
+        }
+    }
+    assert_eq!(
+        weight_usage.get(&0),
+        Some(&2),
+        "Weight 0 used twice (shared)"
+    );
+    assert_eq!(
+        weight_usage.get(&1),
+        Some(&2),
+        "Weight 1 used twice (shared)"
+    );
+    assert_eq!(weight_usage.get(&2), Some(&1), "Weight 2 used once (final)");
+
+    // === Test 8: Verify parameter sharing explicitly ===
+    let mut param_usage = std::collections::HashMap::new();
+    for instr in &export.instructions {
+        match instr {
+            InstructionExport::AddElementwise { parameters, .. }
+            | InstructionExport::MulElementwise { parameters, .. } => {
+                *param_usage.entry(*parameters).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(param_usage.get(&0), Some(&2), "Param 0 used twice (shared)");
+    assert_eq!(param_usage.get(&1), Some(&2), "Param 1 used twice (shared)");
+    assert_eq!(param_usage.get(&2), Some(&2), "Param 2 used twice (shared)");
+
+    // === Test 9: Verify inference equivalence ===
+    let json = final_model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(inputs.as_slice(), &device).reshape([1, 3]);
+
+    let burn_output = final_model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Nested model mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test Scale and Shift with in_place=True.
+/// Mirrors Python's test_scale_and_shift_vectorized.
+/// With in_place=True: no COPY instructions, operates directly on input buffer.
+#[test]
+fn test_scale_and_shift_inplace() {
+    use instmodel::graph::InstructionExport;
+
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Create input buffer
+    let input_buffer = InputBuffer::new(3);
+
+    // Apply scaling by [2, 0.5, 3] then shift by [1, -1, 0] (in-place)
+    let scaled = ops::scale_inplace(vec![2.0, 0.5, 3.0], input_buffer.buffer());
+    let shifted = ops::shift_inplace(vec![1.0, -1.0, 0.0], scaled);
+
+    let model = GraphModel::<TestBackend>::new(vec![input_buffer], shifted, &device)
+        .expect("Model creation should succeed");
+
+    let export = model.to_instruction_model_info();
+
+    // === Validate buffer sizes ===
+    // With in_place=True, both operations work on buffer 0 - only 1 buffer needed
+    assert_eq!(
+        export.buffer_sizes,
+        vec![3],
+        "In-place operations should use only 1 buffer"
+    );
+
+    // === Validate parameters ===
+    assert_eq!(
+        export.parameters.len(),
+        2,
+        "Should have 2 parameter vectors (scale and shift)"
+    );
+    assert_eq!(
+        export.parameters[0],
+        vec![2.0, 0.5, 3.0],
+        "First parameter should be scale vector"
+    );
+    assert_eq!(
+        export.parameters[1],
+        vec![1.0, -1.0, 0.0],
+        "Second parameter should be shift vector"
+    );
+
+    // === Validate instructions - NO COPY, just MUL and ADD on buffer 0 ===
+    assert_eq!(
+        export.instructions.len(),
+        2,
+        "In-place mode should have exactly 2 instructions (no COPY)"
+    );
+
+    // First instruction: MUL_ELEMENTWISE on buffer 0 with parameters 0
+    match &export.instructions[0] {
+        InstructionExport::MulElementwise { input, parameters } => {
+            assert_eq!(*input, 0, "MUL should operate on buffer 0");
+            assert_eq!(*parameters, 0, "MUL should use parameters 0");
+        }
+        other => panic!("Expected MulElementwise for instruction 0, got {:?}", other),
+    }
+
+    // Second instruction: ADD_ELEMENTWISE on buffer 0 with parameters 1
+    match &export.instructions[1] {
+        InstructionExport::AddElementwise { input, parameters } => {
+            assert_eq!(*input, 0, "ADD should operate on buffer 0");
+            assert_eq!(*parameters, 1, "ADD should use parameters 1");
+        }
+        other => panic!("Expected AddElementwise for instruction 1, got {:?}", other),
+    }
+
+    // === Validate numerical correctness ===
+    // Test forward pass: output = (input * scale) + shift
+    let test_input = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0]], &device);
+    let output = model.forward(test_input);
+    let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
+
+    // Expected: [1*2 + 1, 2*0.5 + (-1), 3*3 + 0] = [3, 0, 9]
+    let expected = vec![3.0, 0.0, 9.0];
+    for (i, (got, exp)) in output_data.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            floats_close(*got, *exp, TOLERANCE),
+            "Position {}: got {}, expected {}",
+            i,
+            got,
+            exp
+        );
+    }
+
+    // === Validate inference model matches ===
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0, 3.0];
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (i, (got, exp)) in inference_result.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            floats_close(*got, *exp, TOLERANCE),
+            "Inference position {}: got {}, expected {}",
+            i,
+            got,
+            exp
+        );
+    }
+}
+
+/// Test Scale and Shift with in_place=False (default).
+/// Mirrors Python's test_scale_and_shift_not_inplace.
+/// With in_place=False: COPY instructions are emitted, new buffers allocated.
+#[test]
+fn test_scale_and_shift_not_inplace() {
+    use instmodel::graph::InstructionExport;
+
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Create input buffer
+    let input_buffer = InputBuffer::new(2);
+
+    // Apply scaling then shift (NOT in-place, default behavior)
+    let scaled = ops::scale(vec![2.0, 3.0], input_buffer.buffer());
+    let shifted = ops::shift(vec![10.0, 20.0], scaled);
+
+    let model = GraphModel::<TestBackend>::new(vec![input_buffer], shifted, &device)
+        .expect("Model creation should succeed");
+
+    let export = model.to_instruction_model_info();
+
+    // === Validate buffer sizes ===
+    // With in_place=False: input=0, scale_output=1, shift_output=2
+    assert_eq!(
+        export.buffer_sizes,
+        vec![2, 2, 2],
+        "Not in-place should allocate 3 buffers"
+    );
+
+    // === Validate parameters ===
+    assert_eq!(
+        export.parameters.len(),
+        2,
+        "Should have 2 parameter vectors"
+    );
+
+    // === Validate instructions - COPY + MUL, COPY + ADD ===
+    assert_eq!(
+        export.instructions.len(),
+        4,
+        "Not in-place mode should have 4 instructions (COPY+MUL, COPY+ADD)"
+    );
+
+    // Instruction 0: COPY 0 → 1
+    match &export.instructions[0] {
+        InstructionExport::Copy {
+            input,
+            output,
+            internal_index,
+        } => {
+            assert_eq!(*input, 0, "COPY should read from buffer 0");
+            assert_eq!(*output, 1, "COPY should write to buffer 1");
+            assert_eq!(*internal_index, 0, "COPY internal_index should be 0");
+        }
+        other => panic!("Expected Copy for instruction 0, got {:?}", other),
+    }
+
+    // Instruction 1: MUL_ELEMENTWISE on buffer 1
+    match &export.instructions[1] {
+        InstructionExport::MulElementwise { input, parameters } => {
+            assert_eq!(*input, 1, "MUL should operate on buffer 1");
+            assert_eq!(*parameters, 0, "MUL should use parameters 0");
+        }
+        other => panic!("Expected MulElementwise for instruction 1, got {:?}", other),
+    }
+
+    // Instruction 2: COPY 1 → 2
+    match &export.instructions[2] {
+        InstructionExport::Copy {
+            input,
+            output,
+            internal_index,
+        } => {
+            assert_eq!(*input, 1, "COPY should read from buffer 1");
+            assert_eq!(*output, 2, "COPY should write to buffer 2");
+            assert_eq!(*internal_index, 0, "COPY internal_index should be 0");
+        }
+        other => panic!("Expected Copy for instruction 2, got {:?}", other),
+    }
+
+    // Instruction 3: ADD_ELEMENTWISE on buffer 2
+    match &export.instructions[3] {
+        InstructionExport::AddElementwise { input, parameters } => {
+            assert_eq!(*input, 2, "ADD should operate on buffer 2");
+            assert_eq!(*parameters, 1, "ADD should use parameters 1");
+        }
+        other => panic!("Expected AddElementwise for instruction 3, got {:?}", other),
+    }
+
+    // === Validate numerical correctness ===
+    let test_input = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0]], &device);
+    let output = model.forward(test_input);
+    let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
+
+    // Expected: [1*2 + 10, 2*3 + 20] = [12, 26]
+    let expected = vec![12.0, 26.0];
+    for (i, (got, exp)) in output_data.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            floats_close(*got, *exp, TOLERANCE),
+            "Position {}: got {}, expected {}",
+            i,
+            got,
+            exp
+        );
+    }
+
+    // === Validate inference model matches ===
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    let inputs = vec![1.0f32, 2.0];
+    let inference_result = inference_model
+        .predict(&inputs)
+        .expect("Inference should succeed");
+
+    for (i, (got, exp)) in inference_result.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            floats_close(*got, *exp, TOLERANCE),
+            "Inference position {}: got {}, expected {}",
+            i,
+            got,
+            exp
+        );
+    }
+}
+
+/// Test BatchNorm with in_place=True.
+/// Verifies that BatchNorm with in_place=True operates directly on input buffer.
+#[test]
+fn test_batch_norm_inplace() {
+    use instmodel::graph::InstructionExport;
+
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input_buffer = InputBuffer::new(3);
+    let normalized = ops::batch_norm_inplace(input_buffer.buffer());
+
+    let model = GraphModel::<TestBackend>::new(vec![input_buffer], normalized, &device)
+        .expect("Model creation should succeed");
+
+    let export = model.to_instruction_model_info();
+
+    // === Validate buffer sizes ===
+    // With in_place=True, BatchNorm works directly on buffer 0
+    assert_eq!(
+        export.buffer_sizes,
+        vec![3],
+        "In-place BatchNorm should use only 1 buffer"
+    );
+
+    // === Validate parameters ===
+    // BatchNorm has 3 parameters: center (beta init), scale (1/std), shift (beta final)
+    assert_eq!(
+        export.parameters.len(),
+        3,
+        "BatchNorm should have 3 parameter vectors"
+    );
+
+    // === Validate instructions ===
+    // In-place BatchNorm: ADD, MUL, ADD (no COPY)
+    assert_eq!(
+        export.instructions.len(),
+        3,
+        "In-place BatchNorm should have 3 instructions (no COPY)"
+    );
+
+    // Verify all instructions operate on buffer 0
+    for (i, instr) in export.instructions.iter().enumerate() {
+        match instr {
+            InstructionExport::AddElementwise { input, .. }
+            | InstructionExport::MulElementwise { input, .. } => {
+                assert_eq!(*input, 0, "Instruction {} should operate on buffer 0", i);
+            }
+            other => panic!("Unexpected instruction type at position {}: {:?}", i, other),
+        }
+    }
+}
+
+/// Test BatchNorm with in_place=False (default).
+/// Verifies that BatchNorm with in_place=False allocates a new buffer.
+#[test]
+fn test_batch_norm_not_inplace() {
+    use instmodel::graph::InstructionExport;
+
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input_buffer = InputBuffer::new(3);
+    let normalized = ops::batch_norm(input_buffer.buffer()); // Default is in_place=false
+
+    let model = GraphModel::<TestBackend>::new(vec![input_buffer], normalized, &device)
+        .expect("Model creation should succeed");
+
+    let export = model.to_instruction_model_info();
+
+    // === Validate buffer sizes ===
+    // With in_place=False, BatchNorm allocates buffer 1
+    assert_eq!(
+        export.buffer_sizes,
+        vec![3, 3],
+        "Not in-place BatchNorm should use 2 buffers"
+    );
+
+    // === Validate instructions ===
+    // Not in-place BatchNorm: COPY, ADD, MUL, ADD
+    assert_eq!(
+        export.instructions.len(),
+        4,
+        "Not in-place BatchNorm should have 4 instructions (COPY + 3 ops)"
+    );
+
+    // First instruction should be COPY 0 → 1
+    match &export.instructions[0] {
+        InstructionExport::Copy {
+            input,
+            output,
+            internal_index,
+        } => {
+            assert_eq!(*input, 0, "COPY should read from buffer 0");
+            assert_eq!(*output, 1, "COPY should write to buffer 1");
+            assert_eq!(*internal_index, 0, "COPY internal_index should be 0");
+        }
+        other => panic!("Expected Copy for instruction 0, got {:?}", other),
+    }
+
+    // Remaining instructions should operate on buffer 1
+    for (i, instr) in export.instructions.iter().skip(1).enumerate() {
+        match instr {
+            InstructionExport::AddElementwise { input, .. }
+            | InstructionExport::MulElementwise { input, .. } => {
+                assert_eq!(
+                    *input,
+                    1,
+                    "Instruction {} should operate on buffer 1",
+                    i + 1
+                );
+            }
+            other => panic!(
+                "Unexpected instruction type at position {}: {:?}",
+                i + 1,
+                other
+            ),
+        }
+    }
+}
+
+/// Test that in_place=true produces the SAME output as in_place=false.
+/// This is the critical correctness test: both modes must be numerically equivalent.
+#[test]
+fn test_inplace_produces_same_output_as_not_inplace() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Test 1: Scale operation
+    {
+        let input_inplace = InputBuffer::new(3);
+        let output_inplace = ops::scale_inplace(vec![2.0, 3.0, 4.0], input_inplace.buffer());
+        let model_inplace =
+            GraphModel::<TestBackend>::new(vec![input_inplace], output_inplace, &device)
+                .expect("Model creation should succeed");
+
+        let input_not_inplace = InputBuffer::new(3);
+        let output_not_inplace = ops::scale(vec![2.0, 3.0, 4.0], input_not_inplace.buffer());
+        let model_not_inplace =
+            GraphModel::<TestBackend>::new(vec![input_not_inplace], output_not_inplace, &device)
+                .expect("Model creation should succeed");
+
+        let test_input = [1.0f32, 2.0, 3.0];
+        let tensor_inplace =
+            Tensor::<TestBackend, 1>::from_floats(test_input.as_slice(), &device).reshape([1, 3]);
+        let tensor_not_inplace =
+            Tensor::<TestBackend, 1>::from_floats(test_input.as_slice(), &device).reshape([1, 3]);
+
+        let result_inplace: Vec<f32> = model_inplace
+            .forward(tensor_inplace)
+            .to_data()
+            .to_vec()
+            .unwrap();
+        let result_not_inplace: Vec<f32> = model_not_inplace
+            .forward(tensor_not_inplace)
+            .to_data()
+            .to_vec()
+            .unwrap();
+
+        for (i, (a, b)) in result_inplace
+            .iter()
+            .zip(result_not_inplace.iter())
+            .enumerate()
+        {
+            assert!(
+                floats_close(*a, *b, TOLERANCE),
+                "Scale: in_place vs not_inplace differ at {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
+    }
+
+    // Test 2: Shift operation
+    {
+        let input_inplace = InputBuffer::new(3);
+        let output_inplace = ops::shift_inplace(vec![10.0, 20.0, 30.0], input_inplace.buffer());
+        let model_inplace =
+            GraphModel::<TestBackend>::new(vec![input_inplace], output_inplace, &device)
+                .expect("Model creation should succeed");
+
+        let input_not_inplace = InputBuffer::new(3);
+        let output_not_inplace = ops::shift(vec![10.0, 20.0, 30.0], input_not_inplace.buffer());
+        let model_not_inplace =
+            GraphModel::<TestBackend>::new(vec![input_not_inplace], output_not_inplace, &device)
+                .expect("Model creation should succeed");
+
+        let test_input = [1.0f32, 2.0, 3.0];
+        let tensor_inplace =
+            Tensor::<TestBackend, 1>::from_floats(test_input.as_slice(), &device).reshape([1, 3]);
+        let tensor_not_inplace =
+            Tensor::<TestBackend, 1>::from_floats(test_input.as_slice(), &device).reshape([1, 3]);
+
+        let result_inplace: Vec<f32> = model_inplace
+            .forward(tensor_inplace)
+            .to_data()
+            .to_vec()
+            .unwrap();
+        let result_not_inplace: Vec<f32> = model_not_inplace
+            .forward(tensor_not_inplace)
+            .to_data()
+            .to_vec()
+            .unwrap();
+
+        for (i, (a, b)) in result_inplace
+            .iter()
+            .zip(result_not_inplace.iter())
+            .enumerate()
+        {
+            assert!(
+                floats_close(*a, *b, TOLERANCE),
+                "Shift: in_place vs not_inplace differ at {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
+    }
+
+    // Test 3: BatchNorm operation
+    {
+        let input_inplace = InputBuffer::new(4);
+        let output_inplace = ops::batch_norm_inplace(input_inplace.buffer());
+        let model_inplace =
+            GraphModel::<TestBackend>::new(vec![input_inplace], output_inplace, &device)
+                .expect("Model creation should succeed");
+
+        let input_not_inplace = InputBuffer::new(4);
+        let output_not_inplace = ops::batch_norm(input_not_inplace.buffer());
+        let model_not_inplace =
+            GraphModel::<TestBackend>::new(vec![input_not_inplace], output_not_inplace, &device)
+                .expect("Model creation should succeed");
+
+        let test_input = [1.0f32, 2.0, 3.0, 4.0];
+        let tensor_inplace =
+            Tensor::<TestBackend, 1>::from_floats(test_input.as_slice(), &device).reshape([1, 4]);
+        let tensor_not_inplace =
+            Tensor::<TestBackend, 1>::from_floats(test_input.as_slice(), &device).reshape([1, 4]);
+
+        let result_inplace: Vec<f32> = model_inplace
+            .forward(tensor_inplace)
+            .to_data()
+            .to_vec()
+            .unwrap();
+        let result_not_inplace: Vec<f32> = model_not_inplace
+            .forward(tensor_not_inplace)
+            .to_data()
+            .to_vec()
+            .unwrap();
+
+        for (i, (a, b)) in result_inplace
+            .iter()
+            .zip(result_not_inplace.iter())
+            .enumerate()
+        {
+            assert!(
+                floats_close(*a, *b, TOLERANCE),
+                "BatchNorm: in_place vs not_inplace differ at {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
+    }
+
+    // Test 4: Combined Scale + Shift chain
+    {
+        let input_inplace = InputBuffer::new(3);
+        let scaled_inplace = ops::scale_inplace(vec![2.0, 3.0, 4.0], input_inplace.buffer());
+        let output_inplace = ops::shift_inplace(vec![1.0, 1.0, 1.0], scaled_inplace);
+        let model_inplace =
+            GraphModel::<TestBackend>::new(vec![input_inplace], output_inplace, &device)
+                .expect("Model creation should succeed");
+
+        let input_not_inplace = InputBuffer::new(3);
+        let scaled_not_inplace = ops::scale(vec![2.0, 3.0, 4.0], input_not_inplace.buffer());
+        let output_not_inplace = ops::shift(vec![1.0, 1.0, 1.0], scaled_not_inplace);
+        let model_not_inplace =
+            GraphModel::<TestBackend>::new(vec![input_not_inplace], output_not_inplace, &device)
+                .expect("Model creation should succeed");
+
+        let test_input = [1.0f32, 2.0, 3.0];
+        let tensor_inplace =
+            Tensor::<TestBackend, 1>::from_floats(test_input.as_slice(), &device).reshape([1, 3]);
+        let tensor_not_inplace =
+            Tensor::<TestBackend, 1>::from_floats(test_input.as_slice(), &device).reshape([1, 3]);
+
+        let result_inplace: Vec<f32> = model_inplace
+            .forward(tensor_inplace)
+            .to_data()
+            .to_vec()
+            .unwrap();
+        let result_not_inplace: Vec<f32> = model_not_inplace
+            .forward(tensor_not_inplace)
+            .to_data()
+            .to_vec()
+            .unwrap();
+
+        // Expected: [1*2+1, 2*3+1, 3*4+1] = [3, 7, 13]
+        let expected = [3.0, 7.0, 13.0];
+
+        for (i, (a, b)) in result_inplace
+            .iter()
+            .zip(result_not_inplace.iter())
+            .enumerate()
+        {
+            assert!(
+                floats_close(*a, *b, TOLERANCE),
+                "Chain: in_place vs not_inplace differ at {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+            assert!(
+                floats_close(*a, expected[i], TOLERANCE),
+                "Chain: result {} differs from expected: {} vs {}",
+                i,
+                a,
+                expected[i]
+            );
+        }
+    }
+}
+
+/// Test that in_place operations chain correctly - mixed in_place modes.
+/// This tests a realistic scenario where some operations are in_place and others are not.
+#[test]
+fn test_mixed_inplace_operations() {
+    use instmodel::graph::InstructionExport;
+
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input_buffer = InputBuffer::new(4);
+
+    // Chain: Scale(in_place=false) → Shift(in_place=true) → Scale(in_place=false)
+    // Buffer 0: input
+    // Buffer 1: after first Scale (COPY 0→1, MUL 1)
+    // Shift in_place on buffer 1 (ADD 1, no new buffer)
+    // Buffer 2: after second Scale (COPY 1→2, MUL 2)
+    let x = ops::scale(vec![1.0, 2.0, 3.0, 4.0], input_buffer.buffer()); // not in_place
+    let x = ops::shift_inplace(vec![0.5, 0.5, 0.5, 0.5], x); // in_place
+    let x = ops::scale(vec![2.0, 2.0, 2.0, 2.0], x); // not in_place
+
+    let model = GraphModel::<TestBackend>::new(vec![input_buffer], x, &device)
+        .expect("Model creation should succeed");
+
+    let export = model.to_instruction_model_info();
+
+    // === Validate buffer sizes ===
+    // Buffer 0: input, Buffer 1: first scale output, Buffer 2: second scale output
+    // Shift in_place modifies buffer 1
+    assert_eq!(
+        export.buffer_sizes,
+        vec![4, 4, 4],
+        "Mixed in_place should use 3 buffers"
+    );
+
+    // === Validate instruction count ===
+    // COPY 0→1, MUL 1 (scale), ADD 1 (shift in_place), COPY 1→2, MUL 2 (scale)
+    assert_eq!(
+        export.instructions.len(),
+        5,
+        "Mixed mode should have 5 instructions"
+    );
+
+    // Verify instruction sequence
+    // 0: COPY 0→1
+    match &export.instructions[0] {
+        InstructionExport::Copy { input, output, .. } => {
+            assert_eq!(*input, 0);
+            assert_eq!(*output, 1);
+        }
+        other => panic!("Expected Copy at 0, got {:?}", other),
+    }
+
+    // 1: MUL on buffer 1
+    match &export.instructions[1] {
+        InstructionExport::MulElementwise { input, .. } => {
+            assert_eq!(*input, 1);
+        }
+        other => panic!("Expected MulElementwise at 1, got {:?}", other),
+    }
+
+    // 2: ADD on buffer 1 (in_place shift)
+    match &export.instructions[2] {
+        InstructionExport::AddElementwise { input, .. } => {
+            assert_eq!(*input, 1, "In-place shift should operate on buffer 1");
+        }
+        other => panic!("Expected AddElementwise at 2, got {:?}", other),
+    }
+
+    // 3: COPY 1→2
+    match &export.instructions[3] {
+        InstructionExport::Copy { input, output, .. } => {
+            assert_eq!(*input, 1);
+            assert_eq!(*output, 2);
+        }
+        other => panic!("Expected Copy at 3, got {:?}", other),
+    }
+
+    // 4: MUL on buffer 2
+    match &export.instructions[4] {
+        InstructionExport::MulElementwise { input, .. } => {
+            assert_eq!(*input, 2);
+        }
+        other => panic!("Expected MulElementwise at 4, got {:?}", other),
+    }
+
+    // === Validate numerical correctness ===
+    // input = [1, 2, 3, 4]
+    // after scale: [1*1, 2*2, 3*3, 4*4] = [1, 4, 9, 16]
+    // after shift: [1+0.5, 4+0.5, 9+0.5, 16+0.5] = [1.5, 4.5, 9.5, 16.5]
+    // after scale: [1.5*2, 4.5*2, 9.5*2, 16.5*2] = [3, 9, 19, 33]
+    let test_input = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+    let output = model.forward(test_input);
+    let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
+
+    let expected = vec![3.0, 9.0, 19.0, 33.0];
+    for (i, (got, exp)) in output_data.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            floats_close(*got, *exp, TOLERANCE),
+            "Position {}: got {}, expected {}",
+            i,
+            got,
+            exp
         );
     }
 }

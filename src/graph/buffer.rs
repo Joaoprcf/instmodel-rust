@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::operation::Operation;
+use super::operation::{OpId, Operation};
 
 /// Global counter for unique buffer IDs.
 static BUFFER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -13,23 +13,58 @@ static BUFFER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Unique identifier for a DataBuffer.
 pub type BufferId = usize;
 
+/// What produced a DataBuffer - either a primitive Operation or a sub-graph.
+///
+/// This enables nested model composition where a ModelGraph can be applied
+/// like any other operation, returning a DataBuffer that can be further processed.
+#[derive(Clone, Debug)]
+pub enum Producer {
+    /// A primitive operation (Dense, Add, Concat, etc.)
+    Op(Operation),
+    /// A sub-model graph being applied to new inputs.
+    /// During compilation, this is expanded by remapping the sub-graph's
+    /// input buffer IDs to the actual input buffer indices.
+    SubGraph {
+        /// Unique ID for this sub-graph (used for weight sharing)
+        id: OpId,
+        /// Original InputBuffer IDs from the sub-model (in order)
+        input_ids: Vec<BufferId>,
+        /// The output buffer carrying the sub-graph structure
+        output: Box<DataBuffer>,
+    },
+}
+
 /// DataBuffer represents a node in the computation graph.
 ///
 /// It tracks:
 /// - The size of the data (output dimension)
-/// - The operation that produced it (if any)
-/// - The input buffers used by that operation
+/// - The producer that created it (if any) - either an Operation or SubGraph
+/// - The input buffers used by that producer
 #[derive(Clone, Debug)]
 pub struct DataBuffer {
     id: BufferId,
     size: usize,
-    producer: Option<Operation>,
+    producer: Option<Producer>,
     inputs: Vec<DataBuffer>,
 }
 
 impl DataBuffer {
-    /// Creates a new DataBuffer with the given size and producer.
+    /// Creates a new DataBuffer with the given size and operation producer.
     pub(crate) fn new(size: usize, producer: Option<Operation>, inputs: Vec<DataBuffer>) -> Self {
+        Self {
+            id: BUFFER_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+            size,
+            producer: producer.map(Producer::Op),
+            inputs,
+        }
+    }
+
+    /// Creates a new DataBuffer with a generic producer.
+    pub(crate) fn new_with_producer(
+        size: usize,
+        producer: Option<Producer>,
+        inputs: Vec<DataBuffer>,
+    ) -> Self {
         Self {
             id: BUFFER_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
             size,
@@ -53,8 +88,8 @@ impl DataBuffer {
         self.producer.is_none()
     }
 
-    /// Returns the producer operation, if any.
-    pub fn producer(&self) -> Option<&Operation> {
+    /// Returns the producer, if any.
+    pub fn producer(&self) -> Option<&Producer> {
         self.producer.as_ref()
     }
 

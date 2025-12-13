@@ -16,7 +16,7 @@ pub type OpId = usize;
 static OP_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Generates a new unique operation ID.
-fn next_op_id() -> OpId {
+pub fn next_op_id() -> OpId {
     OP_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
@@ -38,17 +38,29 @@ pub enum Operation {
     /// Softmax activation (operates across entire buffer).
     Softmax { id: OpId },
     /// Element-wise multiply by a fixed parameter vector.
-    Scale { id: OpId, vector: Vec<f32> },
+    /// - in_place: if true, operates directly on input buffer (no COPY)
+    Scale {
+        id: OpId,
+        vector: Vec<f32>,
+        in_place: bool,
+    },
     /// Element-wise add a fixed parameter vector.
-    Shift { id: OpId, vector: Vec<f32> },
+    /// - in_place: if true, operates directly on input buffer (no COPY)
+    Shift {
+        id: OpId,
+        vector: Vec<f32>,
+        in_place: bool,
+    },
     /// Batch normalization layer with trainable parameters.
     /// - center: if true, learn beta (bias); if false, beta=0
     /// - scale: if true, learn gamma; if false, gamma=1
+    /// - in_place: if true, operates directly on input buffer (no COPY)
     BatchNorm {
         id: OpId,
         epsilon: f32,
         center: bool,
         scale: bool,
+        in_place: bool,
     },
 }
 
@@ -83,39 +95,68 @@ impl Operation {
     }
 
     /// Creates a new Scale operation (element-wise multiply by fixed vector).
+    /// Default: in_place=false (creates new buffer with COPY)
     pub fn scale(vector: Vec<f32>) -> Self {
+        Self::scale_with_inplace(vector, false)
+    }
+
+    /// Creates a new Scale operation with explicit in_place setting.
+    pub fn scale_with_inplace(vector: Vec<f32>, in_place: bool) -> Self {
         Self::Scale {
             id: next_op_id(),
             vector,
+            in_place,
         }
     }
 
     /// Creates a new Shift operation (element-wise add fixed vector).
+    /// Default: in_place=false (creates new buffer with COPY)
     pub fn shift(vector: Vec<f32>) -> Self {
+        Self::shift_with_inplace(vector, false)
+    }
+
+    /// Creates a new Shift operation with explicit in_place setting.
+    pub fn shift_with_inplace(vector: Vec<f32>, in_place: bool) -> Self {
         Self::Shift {
             id: next_op_id(),
             vector,
+            in_place,
         }
     }
 
     /// Creates a new BatchNorm operation with trainable parameters.
     /// - center: if true, learn beta; if false, beta=0
     /// - scale: if true, learn gamma; if false, gamma=1
+    ///
+    /// Default: in_place=false (creates new buffer with COPY)
     pub fn batch_norm(epsilon: f32, center: bool, scale: bool) -> Self {
+        Self::batch_norm_with_inplace(epsilon, center, scale, false)
+    }
+
+    /// Creates a new BatchNorm operation with explicit in_place setting.
+    pub fn batch_norm_with_inplace(
+        epsilon: f32,
+        center: bool,
+        scale: bool,
+        in_place: bool,
+    ) -> Self {
         Self::BatchNorm {
             id: next_op_id(),
             epsilon,
             center,
             scale,
+            in_place,
         }
     }
 
     /// Creates a new BatchNorm operation with default epsilon (1e-3) and both center and scale enabled.
+    /// Default: in_place=false
     pub fn batch_norm_default() -> Self {
         Self::batch_norm(1e-3, true, true)
     }
 
     /// Creates a new BatchNorm operation with scale only (no centering beta).
+    /// Default: in_place=false
     pub fn batch_norm_scale_only(epsilon: f32) -> Self {
         Self::batch_norm(epsilon, false, true)
     }
@@ -305,6 +346,28 @@ pub mod ops {
         Operation::shift(vector).apply(input)
     }
 
+    /// Scales (element-wise multiply) the input by a fixed parameter vector, in-place.
+    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
+    pub fn scale_inplace(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
+        assert_eq!(
+            vector.len(),
+            input.size(),
+            "Scale vector length must match input size"
+        );
+        Operation::scale_with_inplace(vector, true).apply(input)
+    }
+
+    /// Shifts (element-wise add) the input by a fixed parameter vector, in-place.
+    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
+    pub fn shift_inplace(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
+        assert_eq!(
+            vector.len(),
+            input.size(),
+            "Shift vector length must match input size"
+        );
+        Operation::shift_with_inplace(vector, true).apply(input)
+    }
+
     /// Applies batch normalization to the input (with center and scale enabled).
     ///
     /// During training, tracks running mean/variance. At export, converts to
@@ -376,6 +439,23 @@ pub mod ops {
         input: DataBuffer,
     ) -> DataBuffer {
         Operation::batch_norm(epsilon, center, scale).apply(input)
+    }
+
+    /// Applies batch normalization in-place (with center and scale enabled).
+    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
+    pub fn batch_norm_inplace(input: DataBuffer) -> DataBuffer {
+        Operation::batch_norm_with_inplace(1e-3, true, true, true).apply(input)
+    }
+
+    /// Applies batch normalization with full configuration, in-place.
+    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
+    pub fn batch_norm_config_inplace(
+        epsilon: f32,
+        center: bool,
+        scale: bool,
+        input: DataBuffer,
+    ) -> DataBuffer {
+        Operation::batch_norm_with_inplace(epsilon, center, scale, true).apply(input)
     }
 }
 
@@ -468,49 +548,67 @@ impl Operation {
 
                 output_index
             }
-            Self::Scale { id, vector } => {
-                let output_size = vector.len();
-                let output_index = ctx.allocate_buffer(output_size);
-
-                // First copy input to output
-                let copy_instruction = InstructionExport::Copy {
-                    input: input_indices[0],
-                    output: output_index,
-                    internal_index: 0,
+            Self::Scale {
+                id,
+                vector,
+                in_place,
+            } => {
+                let target_index = if *in_place {
+                    // in_place=true: operate directly on input buffer (no COPY, no new buffer)
+                    input_indices[0]
+                } else {
+                    // in_place=false: allocate new buffer and copy input
+                    let output_size = vector.len();
+                    let output_index = ctx.allocate_buffer(output_size);
+                    let copy_instruction = InstructionExport::Copy {
+                        input: input_indices[0],
+                        output: output_index,
+                        internal_index: 0,
+                    };
+                    ctx.add_instruction(copy_instruction);
+                    output_index
                 };
-                ctx.add_instruction(copy_instruction);
 
                 // Store parameters and add MUL_ELEMENTWISE instruction
                 let param_index = ctx.get_or_store_parameters(*id, vector);
                 let mul_instruction = InstructionExport::MulElementwise {
-                    input: output_index,
+                    input: target_index,
                     parameters: param_index,
                 };
                 ctx.add_instruction(mul_instruction);
 
-                output_index
+                target_index
             }
-            Self::Shift { id, vector } => {
-                let output_size = vector.len();
-                let output_index = ctx.allocate_buffer(output_size);
-
-                // First copy input to output
-                let copy_instruction = InstructionExport::Copy {
-                    input: input_indices[0],
-                    output: output_index,
-                    internal_index: 0,
+            Self::Shift {
+                id,
+                vector,
+                in_place,
+            } => {
+                let target_index = if *in_place {
+                    // in_place=true: operate directly on input buffer (no COPY, no new buffer)
+                    input_indices[0]
+                } else {
+                    // in_place=false: allocate new buffer and copy input
+                    let output_size = vector.len();
+                    let output_index = ctx.allocate_buffer(output_size);
+                    let copy_instruction = InstructionExport::Copy {
+                        input: input_indices[0],
+                        output: output_index,
+                        internal_index: 0,
+                    };
+                    ctx.add_instruction(copy_instruction);
+                    output_index
                 };
-                ctx.add_instruction(copy_instruction);
 
                 // Store parameters and add ADD_ELEMENTWISE instruction
                 let param_index = ctx.get_or_store_parameters(*id, vector);
                 let add_instruction = InstructionExport::AddElementwise {
-                    input: output_index,
+                    input: target_index,
                     parameters: param_index,
                 };
                 ctx.add_instruction(add_instruction);
 
-                output_index
+                target_index
             }
             Self::BatchNorm { .. } => {
                 panic!(
@@ -533,25 +631,30 @@ impl Operation {
         std: &[f32],
         beta: &[f32],
     ) -> usize {
-        let Self::BatchNorm { id, .. } = self else {
+        let Self::BatchNorm { id, in_place, .. } = self else {
             panic!("compile_batch_norm called on non-BatchNorm operation");
         };
 
-        let output_size = ctx.buffer_sizes[input_indices[0]];
-        let output_index = ctx.allocate_buffer(output_size);
-
-        // First copy input to output
-        let copy_instruction = InstructionExport::Copy {
-            input: input_indices[0],
-            output: output_index,
-            internal_index: 0,
+        let target_index = if *in_place {
+            // in_place=true: operate directly on input buffer (no COPY, no new buffer)
+            input_indices[0]
+        } else {
+            // in_place=false: allocate new buffer and copy input
+            let output_size = ctx.buffer_sizes[input_indices[0]];
+            let output_index = ctx.allocate_buffer(output_size);
+            let copy_instruction = InstructionExport::Copy {
+                input: input_indices[0],
+                output: output_index,
+                internal_index: 0,
+            };
+            ctx.add_instruction(copy_instruction);
+            output_index
         };
-        ctx.add_instruction(copy_instruction);
 
         // 1. ADD_ELEMENTWISE: x + center (i.e., x - mean)
         let center_param_index = ctx.get_or_store_parameters(*id, center);
         let center_instruction = InstructionExport::AddElementwise {
-            input: output_index,
+            input: target_index,
             parameters: center_param_index,
         };
         ctx.add_instruction(center_instruction);
@@ -559,7 +662,7 @@ impl Operation {
         // 2. MUL_ELEMENTWISE: x * std (i.e., x * gamma / sqrt(var + eps))
         let std_param_index = ctx.get_or_store_parameters(*id + 1_000_000, std);
         let mul_instruction = InstructionExport::MulElementwise {
-            input: output_index,
+            input: target_index,
             parameters: std_param_index,
         };
         ctx.add_instruction(mul_instruction);
@@ -567,12 +670,12 @@ impl Operation {
         // 3. ADD_ELEMENTWISE: x + beta
         let beta_param_index = ctx.get_or_store_parameters(*id + 2_000_000, beta);
         let beta_instruction = InstructionExport::AddElementwise {
-            input: output_index,
+            input: target_index,
             parameters: beta_param_index,
         };
         ctx.add_instruction(beta_instruction);
 
-        output_index
+        target_index
     }
 }
 

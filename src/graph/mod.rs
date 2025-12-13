@@ -39,7 +39,7 @@ mod compile;
 mod model;
 mod operation;
 
-pub use buffer::{BufferId, DataBuffer, InputBuffer};
+pub use buffer::{BufferId, DataBuffer, InputBuffer, Producer};
 pub use compile::{CompileContext, InstructionExport, InstructionModelExport};
 pub use model::ModelGraph;
 pub use operation::{OpId, Operation, ops};
