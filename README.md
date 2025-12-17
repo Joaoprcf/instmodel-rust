@@ -17,7 +17,8 @@ cargo add instmodel_inference
 ## Features
 
 - **Graph-based model construction** - Build neural networks using a functional API
-- **Weight sharing** - Reuse layers across different parts of the network
+- **Deferred compilation** - Build graph structure first, compile with weights later
+- **Nested model composition** - Compose sub-models and extract them after training
 - **Training support** - Train models with MSE or BCE loss
 - **Export to instruction format** - Export trained models to JSON for use with [instmodel-rust-inference](https://github.com/Joaoprcf/instmodel-rust-inference)
 
@@ -32,6 +33,8 @@ cargo add instmodel_inference
 | Softmax | Softmax normalization |
 | Scale | Element-wise multiply by fixed vector |
 | Shift | Element-wise add fixed vector |
+| BatchNorm | Batch normalization |
+| Activation | Standalone activation function |
 
 ### Supported Activations
 
@@ -65,9 +68,9 @@ fn main() {
 }
 ```
 
-### Graph API with Shared Layers
+### Graph API (Deferred Compilation)
 
-The Graph API allows building complex architectures with branching, merging, and weight sharing.
+The Graph API separates graph construction from weight initialization. Build your model structure first, then compile it to create weights on a specific device.
 
 ```rust
 use instmodel::graph::{InputBuffer, ModelGraph, ops};
@@ -80,25 +83,15 @@ type TestBackend = NdArray;
 fn main() {
     let device = <TestBackend as Backend>::Device::default();
 
-    // Create input buffer
+    // Phase 1: Build graph structure (no device, no weights)
     let input = InputBuffer::new(4);
     let x = input.buffer();
+    let hidden = ops::dense(8, Activation::Relu, x);
+    let output = ops::dense(1, Activation::Sigmoid, hidden);
+    let graph = ModelGraph::new(vec![input], output);
 
-    // Create a shared dense layer (will be reused)
-    let shared_layer = instmodel::graph::Operation::dense(4, Activation::Relu);
-
-    // Apply the same layer to two different branches
-    let branch1 = shared_layer.apply(x.clone());
-    let branch2 = shared_layer.apply(x.clone());  // Same weights as branch1!
-
-    // Merge branches with element-wise addition
-    let merged = ops::add(vec![branch1, branch2]);
-
-    // Final output layer (not shared)
-    let output = ops::dense(1, Activation::Sigmoid, merged);
-
-    // Build the model
-    let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+    // Phase 2: Compile with device (weights initialized here)
+    let model = graph.compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     // Run inference
@@ -115,9 +108,64 @@ fn main() {
 }
 ```
 
-### Non-Shared Layers (Default)
+### Nested Models with Sub-Model Extraction
 
-When using `ops::dense()`, each call creates a new layer with independent weights:
+Build complex architectures by composing sub-models. After training the combined model, extract sub-models with the trained weights.
+
+```rust
+use instmodel::graph::{InputBuffer, ModelGraph, ops};
+use instmodel::layers::Activation;
+use burn::backend::{Autodiff, NdArray};
+use burn::tensor::{Tensor, backend::Backend};
+
+type TestBackend = NdArray;
+type TrainingBackend = Autodiff<NdArray>;
+
+fn main() {
+    let device = <TrainingBackend as Backend>::Device::default();
+
+    // Create sub-graph for "buy" signal
+    let buy_input = InputBuffer::new(4);
+    let buy_hidden = ops::dense(8, Activation::Relu, buy_input.buffer());
+    let buy_out = ops::dense(1, Activation::Sigmoid, buy_hidden);
+    let buy_graph = ModelGraph::new(vec![buy_input], buy_out);
+
+    // Create sub-graph for "sell" signal
+    let sell_input = InputBuffer::new(4);
+    let sell_hidden = ops::dense(8, Activation::Relu, sell_input.buffer());
+    let sell_out = ops::dense(1, Activation::Sigmoid, sell_hidden);
+    let sell_graph = ModelGraph::new(vec![sell_input], sell_out);
+
+    // Create combined graph using both sub-graphs
+    let main_input = InputBuffer::new(4);
+    let x = main_input.buffer();
+    let buy_result = buy_graph.apply_single(x.clone());
+    let sell_result = sell_graph.apply_single(x);
+    let combined = ops::concat(vec![buy_result, sell_result]);
+    let combined_graph = ModelGraph::new(vec![main_input], combined);
+
+    // Compile the combined model (creates all weights)
+    let mut model = combined_graph.compile::<TrainingBackend>(&device)
+        .expect("Model creation should succeed");
+
+    // ... train the combined model here ...
+
+    // After training, extract sub-models with trained weights
+    let buy_model = model.submodel(&buy_graph);
+    let sell_model = model.submodel(&sell_graph);
+
+    // Sub-models produce the same output as corresponding parts of combined model
+    let test_input = Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+    let combined_result = model.forward(test_input.clone());
+    let buy_result = buy_model.forward(test_input.clone());
+    let sell_result = sell_model.forward(test_input);
+
+    // combined_result[0] == buy_result[0]
+    // combined_result[1] == sell_result[0]
+}
+```
+
+### Branching and Merging
 
 ```rust
 use instmodel::graph::{InputBuffer, ModelGraph, ops};
@@ -133,15 +181,19 @@ fn main() {
     let input = InputBuffer::new(4);
     let x = input.buffer();
 
-    // These are separate layers with different weights
+    // Two separate branches with different weights
     let branch1 = ops::dense(4, Activation::Relu, x.clone());
-    let branch2 = ops::dense(4, Activation::Relu, x.clone());  // Different weights!
+    let branch2 = ops::dense(4, Activation::Relu, x.clone());
 
-    // Merge and output
+    // Merge branches with element-wise addition
     let merged = ops::add(vec![branch1, branch2]);
+
+    // Final output layer
     let output = ops::dense(1, Activation::Sigmoid, merged);
 
-    let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+    // Build graph structure, then compile
+    let graph = ModelGraph::new(vec![input], output);
+    let model = graph.compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model.export_to_instruction_model().unwrap();
@@ -176,7 +228,8 @@ fn main() {
     let hidden = ops::dense(8, Activation::Relu, normalized);
     let output = ops::dense(1, Activation::Sigmoid, hidden);
 
-    let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+    let graph = ModelGraph::new(vec![input], output);
+    let model = graph.compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model.export_to_instruction_model().unwrap();
@@ -257,6 +310,30 @@ fn main() {
     println!("{}", json);
 }
 ```
+
+## API Overview
+
+### Graph Construction (No Backend Required)
+
+- `InputBuffer::new(size)` - Create an input node
+- `ModelGraph::new(inputs, output)` - Create a graph from inputs and output
+- `graph.apply(inputs)` / `graph.apply_single(input)` - Use a graph as a sub-model
+- `ops::dense(size, activation, input)` - Dense layer
+- `ops::add(buffers)` / `ops::multiply(buffers)` - Element-wise operations
+- `ops::concat(buffers)` - Concatenation
+- `ops::batch_norm(input)` - Batch normalization
+- `ops::activation(activation, input)` - Standalone activation
+
+### Compilation (Backend Required)
+
+- `graph.compile::<Backend>(&device)` - Compile graph to `CompiledModel<B>`
+
+### CompiledModel Methods
+
+- `model.forward(input)` - Run inference
+- `model.submodel(&graph)` - Extract sub-model with current weights
+- `model.export_to_instruction_model()` - Export to JSON
+- `model.feature_size()` / `model.output_size()` - Get dimensions
 
 ## License
 

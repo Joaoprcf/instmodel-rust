@@ -1,4 +1,4 @@
-//! ModelGraph - the main container for functional neural networks.
+//! CompiledModel - the compiled neural network with initialized weights.
 
 use std::collections::HashMap;
 
@@ -11,6 +11,7 @@ use crate::layers::Activation;
 
 use super::buffer::{BufferId, DataBuffer, InputBuffer, Producer};
 use super::compile::{CompileContext, InstructionModelExport};
+use super::core::GraphId;
 use super::operation::{OpId, Operation};
 
 /// Initialized Dense layer with Burn's Linear module.
@@ -241,11 +242,28 @@ struct ExportMetadata {
     batch_norm_op_ids: Vec<OpId>,
 }
 
-/// ModelGraph holds the computation graph and initialized layers.
+/// Mapping info for a sub-graph within a compiled model.
+#[derive(Debug, Clone)]
+struct SubgraphMapping {
+    /// Which dense layer indices this sub-graph uses
+    dense_layer_indices: Vec<usize>,
+    /// Which batch norm layer indices this sub-graph uses
+    batch_norm_layer_indices: Vec<usize>,
+    /// The execution steps for this sub-graph
+    steps: Vec<Step>,
+    /// Buffer index mapping for this sub-graph
+    buffer_index: HashMap<BufferId, usize>,
+    /// Input buffer ID for this sub-graph
+    input_buffer_id: BufferId,
+    /// Output buffer ID for this sub-graph
+    output_buffer_id: BufferId,
+}
+
+/// CompiledModel holds the initialized layers and execution steps.
 /// Derives Module to enable training with burn's optimizer.
 #[derive(Module, Debug)]
-pub struct ModelGraph<B: Backend> {
-    /// Trainable dense layers (Vec for Module derive compatibility)
+pub struct CompiledModel<B: Backend> {
+    /// Trainable dense layers
     dense_layers: Vec<DenseLayer<B>>,
     /// Trainable batch normalization layers
     batch_norm_layers: Vec<BatchNormLayer<B>>,
@@ -262,10 +280,12 @@ pub struct ModelGraph<B: Backend> {
     features: Ignored<Vec<String>>,
     #[module(ignore)]
     export_metadata: Ignored<ExportMetadata>,
+    #[module(ignore)]
+    subgraph_mappings: Ignored<HashMap<GraphId, SubgraphMapping>>,
 }
 
-impl<B: Backend> ModelGraph<B> {
-    /// Creates a new ModelGraph from input buffers and output buffer.
+impl<B: Backend> CompiledModel<B> {
+    /// Creates a new CompiledModel from input buffers and output buffer.
     pub fn new(
         inputs: Vec<InputBuffer>,
         output: DataBuffer,
@@ -307,6 +327,7 @@ impl<B: Backend> ModelGraph<B> {
             buffer_index: Ignored(builder.buffer_index),
             features: Ignored(features),
             export_metadata: Ignored(export_metadata),
+            subgraph_mappings: Ignored(builder.subgraph_mappings),
         })
     }
 
@@ -430,42 +451,6 @@ impl<B: Backend> ModelGraph<B> {
     /// Returns the output size of the model.
     pub fn output_size(&self) -> usize {
         self.output.0.size()
-    }
-
-    /// Applies this model to the given inputs, returning a DataBuffer.
-    ///
-    /// This enables nested model composition where a ModelGraph can be used
-    /// like any other operation in the graph. The weights are shared across
-    /// all applications of the same model.
-    pub fn apply(&self, inputs: Vec<DataBuffer>) -> DataBuffer {
-        assert_eq!(
-            inputs.len(),
-            self.inputs.0.len(),
-            "Number of inputs must match the model's input count"
-        );
-
-        // Generate a unique ID for this sub-graph application
-        let id = super::operation::next_op_id();
-
-        // Collect input buffer IDs from the original model
-        let input_ids: Vec<BufferId> = self.inputs.0.iter().map(|i| i.id()).collect();
-
-        DataBuffer::new_with_producer(
-            self.output_size(),
-            Some(Producer::SubGraph {
-                id,
-                input_ids,
-                output: Box::new(self.output.0.clone()),
-            }),
-            inputs,
-        )
-    }
-
-    /// Applies this model to a single input, returning a DataBuffer.
-    ///
-    /// Convenience method for models with a single input.
-    pub fn apply_single(&self, input: DataBuffer) -> DataBuffer {
-        self.apply(vec![input])
     }
 
     /// Exports the model to instruction model JSON format.
@@ -623,9 +608,178 @@ impl<B: Backend> ModelGraph<B> {
         let (center, std, beta) = layer.get_normalization_params();
         producer.compile_batch_norm(input_indices, ctx, &center, &std, &beta)
     }
+
+    /// Extracts a sub-model with the current weights.
+    /// Call this after training to get a sub-model with trained weights.
+    pub fn submodel(&self, graph: &super::core::ModelGraph) -> SubModel<B> {
+        let graph_id = graph.id();
+        let mapping = self
+            .subgraph_mappings
+            .0
+            .get(&graph_id)
+            .expect("Sub-graph not found in compiled model");
+
+        let dense_layers: Vec<DenseLayer<B>> = mapping
+            .dense_layer_indices
+            .iter()
+            .map(|&idx| self.dense_layers[idx].clone())
+            .collect();
+
+        let batch_norm_layers: Vec<BatchNormLayer<B>> = mapping
+            .batch_norm_layer_indices
+            .iter()
+            .map(|&idx| self.batch_norm_layers[idx].clone())
+            .collect();
+
+        SubModel {
+            dense_layers,
+            batch_norm_layers,
+            steps: mapping.steps.clone(),
+            buffer_index: mapping.buffer_index.clone(),
+            input_buffer_id: mapping.input_buffer_id,
+            output_buffer_id: mapping.output_buffer_id,
+            dense_index_map: mapping
+                .dense_layer_indices
+                .iter()
+                .enumerate()
+                .map(|(new_idx, &old_idx)| (old_idx, new_idx))
+                .collect(),
+            batch_norm_index_map: mapping
+                .batch_norm_layer_indices
+                .iter()
+                .enumerate()
+                .map(|(new_idx, &old_idx)| (old_idx, new_idx))
+                .collect(),
+        }
+    }
 }
 
-/// Builder for constructing ModelGraph execution order.
+/// A sub-model extracted from a CompiledModel with cloned weights.
+/// Call `submodel()` after training to get a sub-model with trained weights.
+#[derive(Debug, Clone)]
+pub struct SubModel<B: Backend> {
+    dense_layers: Vec<DenseLayer<B>>,
+    batch_norm_layers: Vec<BatchNormLayer<B>>,
+    steps: Vec<Step>,
+    buffer_index: HashMap<BufferId, usize>,
+    input_buffer_id: BufferId,
+    output_buffer_id: BufferId,
+    dense_index_map: HashMap<usize, usize>,
+    batch_norm_index_map: HashMap<usize, usize>,
+}
+
+impl<B: Backend> SubModel<B> {
+    /// Performs forward pass through the sub-model.
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let mut buffers: HashMap<usize, Tensor<B, 2>> = HashMap::new();
+
+        let input_idx = self.buffer_index[&self.input_buffer_id];
+        buffers.insert(input_idx, input);
+
+        for step in &self.steps {
+            match step {
+                Step::Dense {
+                    layer_index,
+                    input,
+                    output,
+                } => {
+                    let in_idx = self.buffer_index[input];
+                    let out_idx = self.buffer_index[output];
+                    let local_idx = self.dense_index_map[layer_index];
+                    let layer = &self.dense_layers[local_idx];
+                    let result = layer.forward(buffers[&in_idx].clone());
+                    buffers.insert(out_idx, result);
+                }
+                Step::Add { inputs, output } => {
+                    let out_idx = self.buffer_index[output];
+                    let mut result = buffers[&self.buffer_index[&inputs[0]]].clone();
+                    for buf_id in &inputs[1..] {
+                        result = result.add(buffers[&self.buffer_index[buf_id]].clone());
+                    }
+                    buffers.insert(out_idx, result);
+                }
+                Step::Multiply { inputs, output } => {
+                    let out_idx = self.buffer_index[output];
+                    let mut result = buffers[&self.buffer_index[&inputs[0]]].clone();
+                    for buf_id in &inputs[1..] {
+                        result = result.mul(buffers[&self.buffer_index[buf_id]].clone());
+                    }
+                    buffers.insert(out_idx, result);
+                }
+                Step::Concat { inputs, output } => {
+                    let out_idx = self.buffer_index[output];
+                    let tensors: Vec<Tensor<B, 2>> = inputs
+                        .iter()
+                        .map(|buf_id| buffers[&self.buffer_index[buf_id]].clone())
+                        .collect();
+                    let result = Tensor::cat(tensors, 1);
+                    buffers.insert(out_idx, result);
+                }
+                Step::Softmax { input, output } => {
+                    let in_idx = self.buffer_index[input];
+                    let out_idx = self.buffer_index[output];
+                    let result = burn::tensor::activation::softmax(buffers[&in_idx].clone(), 1);
+                    buffers.insert(out_idx, result);
+                }
+                Step::Scale {
+                    input,
+                    output,
+                    vector,
+                } => {
+                    let in_idx = self.buffer_index[input];
+                    let out_idx = self.buffer_index[output];
+                    let in_tensor = buffers[&in_idx].clone();
+                    let device = in_tensor.device();
+                    let scale_tensor =
+                        Tensor::<B, 1>::from_floats(vector.as_slice(), &device).reshape([1, -1]);
+                    let result = in_tensor.mul(scale_tensor);
+                    buffers.insert(out_idx, result);
+                }
+                Step::Shift {
+                    input,
+                    output,
+                    vector,
+                } => {
+                    let in_idx = self.buffer_index[input];
+                    let out_idx = self.buffer_index[output];
+                    let in_tensor = buffers[&in_idx].clone();
+                    let device = in_tensor.device();
+                    let shift_tensor =
+                        Tensor::<B, 1>::from_floats(vector.as_slice(), &device).reshape([1, -1]);
+                    let result = in_tensor.add(shift_tensor);
+                    buffers.insert(out_idx, result);
+                }
+                Step::BatchNorm {
+                    layer_index,
+                    input,
+                    output,
+                } => {
+                    let in_idx = self.buffer_index[input];
+                    let out_idx = self.buffer_index[output];
+                    let local_idx = self.batch_norm_index_map[layer_index];
+                    let layer = &self.batch_norm_layers[local_idx];
+                    let result = layer.forward(buffers[&in_idx].clone());
+                    buffers.insert(out_idx, result);
+                }
+                Step::StandaloneActivation {
+                    input,
+                    output,
+                    activation,
+                } => {
+                    let in_idx = self.buffer_index[input];
+                    let out_idx = self.buffer_index[output];
+                    let result = activation.apply(buffers[&in_idx].clone());
+                    buffers.insert(out_idx, result);
+                }
+            }
+        }
+
+        let output_idx = self.buffer_index[&self.output_buffer_id];
+        buffers.remove(&output_idx).unwrap()
+    }
+}
+
+/// Builder for constructing CompiledModel execution order.
 struct GraphBuilder {
     buffer_index: HashMap<BufferId, usize>,
     next_idx: usize,
@@ -640,6 +794,8 @@ struct GraphBuilder {
     /// Counter for generating unique buffer IDs for sub-graph internals.
     /// Starts at a high value to avoid collision with global buffer IDs.
     next_subgraph_buffer_id: BufferId,
+    /// Maps GraphId to SubgraphMapping for sub-model extraction.
+    subgraph_mappings: HashMap<GraphId, SubgraphMapping>,
 }
 
 impl GraphBuilder {
@@ -653,9 +809,8 @@ impl GraphBuilder {
             visited: HashMap::new(),
             next_dense_index: 0,
             next_batch_norm_index: 0,
-            // Start sub-graph buffer IDs at a high value to avoid collision
-            // with global buffer IDs which start at 0
             next_subgraph_buffer_id: usize::MAX / 2,
+            subgraph_mappings: HashMap::new(),
         }
     }
 
@@ -694,8 +849,17 @@ impl GraphBuilder {
                 self.traverse_operation(op, buffer, inputs, input_size);
             }
             Producer::SubGraph {
-                input_ids, output, ..
+                input_ids,
+                output,
+                graph_id,
+                ..
             } => {
+                // Record starting state for subgraph mapping
+                let step_start = self.steps.len();
+                let dense_start = self.next_dense_index;
+                let batch_norm_start = self.next_batch_norm_index;
+                let input_buffer_id = inputs[0].id();
+
                 // Build mapping: sub-graph input IDs -> actual input buffer IDs
                 let input_remap: HashMap<BufferId, BufferId> = input_ids
                     .iter()
@@ -708,6 +872,88 @@ impl GraphBuilder {
 
                 // The outer buffer ID maps to the same index as the sub-graph output
                 self.buffer_index.insert(buffer.id(), output_idx);
+
+                // Record subgraph mapping
+                let dense_layer_indices: Vec<usize> =
+                    (dense_start..self.next_dense_index).collect();
+                let batch_norm_layer_indices: Vec<usize> =
+                    (batch_norm_start..self.next_batch_norm_index).collect();
+                let subgraph_steps = self.steps[step_start..].to_vec();
+
+                let mut subgraph_buffer_ids: Vec<BufferId> = vec![input_buffer_id];
+                for step in &subgraph_steps {
+                    match step {
+                        Step::Dense { input, output, .. } => {
+                            subgraph_buffer_ids.push(*input);
+                            subgraph_buffer_ids.push(*output);
+                        }
+                        Step::Add { inputs, output, .. } => {
+                            subgraph_buffer_ids.extend(inputs.iter().copied());
+                            subgraph_buffer_ids.push(*output);
+                        }
+                        Step::Multiply { inputs, output, .. } => {
+                            subgraph_buffer_ids.extend(inputs.iter().copied());
+                            subgraph_buffer_ids.push(*output);
+                        }
+                        Step::Concat { inputs, output, .. } => {
+                            subgraph_buffer_ids.extend(inputs.iter().copied());
+                            subgraph_buffer_ids.push(*output);
+                        }
+                        Step::Softmax { input, output, .. } => {
+                            subgraph_buffer_ids.push(*input);
+                            subgraph_buffer_ids.push(*output);
+                        }
+                        Step::Scale { input, output, .. } => {
+                            subgraph_buffer_ids.push(*input);
+                            subgraph_buffer_ids.push(*output);
+                        }
+                        Step::Shift { input, output, .. } => {
+                            subgraph_buffer_ids.push(*input);
+                            subgraph_buffer_ids.push(*output);
+                        }
+                        Step::BatchNorm { input, output, .. } => {
+                            subgraph_buffer_ids.push(*input);
+                            subgraph_buffer_ids.push(*output);
+                        }
+                        Step::StandaloneActivation { input, output, .. } => {
+                            subgraph_buffer_ids.push(*input);
+                            subgraph_buffer_ids.push(*output);
+                        }
+                    }
+                }
+
+                let subgraph_buffer_index: HashMap<BufferId, usize> = subgraph_buffer_ids
+                    .into_iter()
+                    .filter_map(|buf_id| self.buffer_index.get(&buf_id).map(|&idx| (buf_id, idx)))
+                    .collect();
+
+                // Find output buffer id from the last step
+                let output_buffer_id = subgraph_steps
+                    .last()
+                    .map(|step| match step {
+                        Step::Dense { output, .. } => *output,
+                        Step::Add { output, .. } => *output,
+                        Step::Multiply { output, .. } => *output,
+                        Step::Concat { output, .. } => *output,
+                        Step::Softmax { output, .. } => *output,
+                        Step::Scale { output, .. } => *output,
+                        Step::Shift { output, .. } => *output,
+                        Step::BatchNorm { output, .. } => *output,
+                        Step::StandaloneActivation { output, .. } => *output,
+                    })
+                    .unwrap_or(input_buffer_id);
+
+                self.subgraph_mappings.insert(
+                    *graph_id,
+                    SubgraphMapping {
+                        dense_layer_indices,
+                        batch_norm_layer_indices,
+                        steps: subgraph_steps,
+                        buffer_index: subgraph_buffer_index,
+                        input_buffer_id,
+                        output_buffer_id,
+                    },
+                );
             }
         }
 
@@ -1125,7 +1371,7 @@ mod tests {
         let input = InputBuffer::new(4);
         let output = ops::dense(1, Activation::Sigmoid, input.buffer());
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         assert_eq!(model.feature_size(), 4);
@@ -1140,7 +1386,7 @@ mod tests {
         let x = ops::dense(8, Activation::Relu, input.buffer());
         let output = ops::dense(1, Activation::Sigmoid, x);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         assert_eq!(model.feature_size(), 4);
@@ -1154,7 +1400,7 @@ mod tests {
         let input = InputBuffer::new(2);
         let output = ops::dense(1, Activation::None, input.buffer());
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0]], &device);
@@ -1176,7 +1422,7 @@ mod tests {
         let added = ops::add(vec![branch1, branch2]);
         let output = ops::dense(1, Activation::Sigmoid, added);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
@@ -1197,7 +1443,7 @@ mod tests {
         let multiplied = ops::multiply(vec![branch1, branch2]);
         let output = ops::dense(1, Activation::Sigmoid, multiplied);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
@@ -1218,7 +1464,7 @@ mod tests {
         let added = ops::add(vec![branch1, branch2]);
         let output = ops::dense(1, Activation::Sigmoid, added);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let export = model.to_instruction_model_info();
@@ -1239,7 +1485,7 @@ mod tests {
         let concatenated = ops::concat(vec![branch1, branch2]);
         let output = ops::dense(1, Activation::Sigmoid, concatenated);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         assert_eq!(model.output_size(), 1);
@@ -1257,7 +1503,7 @@ mod tests {
         let x = ops::dense(3, Activation::None, input.buffer());
         let output = ops::softmax(x);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         assert_eq!(model.output_size(), 3);
@@ -1284,7 +1530,7 @@ mod tests {
         let concatenated = ops::concat(vec![branch1, branch2]);
         let output = ops::dense(1, Activation::Sigmoid, concatenated);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let export = model.to_instruction_model_info();
@@ -1300,7 +1546,7 @@ mod tests {
         let x = ops::dense(3, Activation::None, input.buffer());
         let output = ops::softmax(x);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let json = model
@@ -1319,7 +1565,7 @@ mod tests {
         let scaled = ops::scale(vec![2.0, 3.0, 4.0, 5.0], x);
         let output = ops::dense(1, Activation::Sigmoid, scaled);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
@@ -1336,7 +1582,7 @@ mod tests {
         let shifted = ops::shift(vec![0.1, 0.2, 0.3, 0.4], x);
         let output = ops::dense(1, Activation::Sigmoid, shifted);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
@@ -1354,7 +1600,7 @@ mod tests {
         let shifted = ops::shift(vec![1.0, 1.0, 1.0, 1.0], scaled);
         let output = ops::dense(1, Activation::Sigmoid, shifted);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
@@ -1371,7 +1617,7 @@ mod tests {
         let scaled = ops::scale(vec![2.0, 3.0, 4.0, 5.0], x);
         let output = ops::dense(1, Activation::Sigmoid, scaled);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let json = model
@@ -1390,7 +1636,7 @@ mod tests {
         let shifted = ops::shift(vec![0.1, 0.2, 0.3, 0.4], x);
         let output = ops::dense(1, Activation::Sigmoid, shifted);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let json = model
@@ -1409,7 +1655,7 @@ mod tests {
         let normalized = ops::batch_norm(x);
         let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
@@ -1427,7 +1673,7 @@ mod tests {
         let normalized = ops::batch_norm(hidden);
         let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
@@ -1444,7 +1690,7 @@ mod tests {
         let normalized = ops::batch_norm(x);
         let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let json = model
@@ -1545,7 +1791,7 @@ mod tests {
         let normalized = ops::batch_norm(x);
         let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let export = model.to_instruction_model_info();
@@ -1578,7 +1824,7 @@ mod tests {
         let normalized = ops::batch_norm(x);
         let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         let json = model
@@ -1624,7 +1870,7 @@ mod tests {
         let merged = ops::add(vec![branch1, branch2]);
         let output = ops::dense(1, Activation::Sigmoid, merged);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         // Forward pass should work
@@ -1647,7 +1893,7 @@ mod tests {
             let normalized = ops::batch_norm_with_epsilon(epsilon, x);
             let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-            let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+            let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
                 .expect("Model creation should succeed");
 
             let input_tensor =
@@ -1666,7 +1912,7 @@ mod tests {
         let normalized = ops::batch_norm(x);
         let output = ops::dense(2, Activation::None, normalized);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         // Test with batch size > 1
@@ -1691,7 +1937,7 @@ mod tests {
         let normalized = ops::batch_norm(x);
         let output = ops::dense(1, Activation::None, normalized);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         // Test with negative values
@@ -1714,7 +1960,7 @@ mod tests {
         let normalized = ops::batch_norm(x);
         let output = ops::dense(1, Activation::None, normalized);
 
-        let model = ModelGraph::<TestBackend>::new(vec![input], output, &device)
+        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
             .expect("Model creation should succeed");
 
         // Test with all zeros
@@ -1747,7 +1993,7 @@ mod tests {
             let hidden = ops::dense(8, Activation::Relu, x);
             let output = ops::dense(1, Activation::Sigmoid, hidden);
 
-            let mut model = ModelGraph::<TrainingBackend>::new(vec![input], output, &device)
+            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
                 .expect("Model creation should succeed");
 
             let mut optimizer = AdamConfig::new().init();
@@ -1802,7 +2048,7 @@ mod tests {
             let concatenated = ops::concat(vec![branch1, branch2]);
             let output = ops::dense(1, Activation::Sigmoid, concatenated);
 
-            let mut model = ModelGraph::<TrainingBackend>::new(vec![input], output, &device)
+            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
                 .expect("Model creation should succeed");
 
             let mut optimizer = AdamConfig::new().init();
@@ -1822,7 +2068,7 @@ mod tests {
 
                 let grads = loss.backward();
                 let grads_params = GradientsParams::from_grads(grads, &model);
-                model = optimizer.step(0.1, model, grads_params);
+                model = optimizer.step(0.01, model, grads_params);
             }
 
             // Loss should generally decrease over training
@@ -1846,7 +2092,7 @@ mod tests {
             let added = ops::add(vec![branch1, branch2]);
             let output = ops::dense(1, Activation::Sigmoid, added);
 
-            let mut model = ModelGraph::<TrainingBackend>::new(vec![input], output, &device)
+            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
                 .expect("Model creation should succeed");
 
             let mut optimizer = AdamConfig::new().init();
@@ -1894,7 +2140,7 @@ mod tests {
             let concatenated = ops::concat(vec![path1, path2]);
             let output = ops::dense(1, Activation::Sigmoid, concatenated);
 
-            let mut model = ModelGraph::<TrainingBackend>::new(vec![input], output, &device)
+            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
                 .expect("Model creation should succeed");
 
             let mut optimizer = AdamConfig::new().init();
@@ -1929,7 +2175,7 @@ mod tests {
             let hidden = ops::dense(8, Activation::Relu, x);
             let output = ops::dense(1, Activation::None, hidden);
 
-            let mut model = ModelGraph::<TrainingBackend>::new(vec![input], output, &device)
+            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
                 .expect("Model creation should succeed");
 
             let mut optimizer = AdamConfig::new().init();

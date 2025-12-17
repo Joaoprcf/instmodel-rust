@@ -12,6 +12,13 @@ use instmodel_inference::{InstructionModel, InstructionModelInfo};
 
 type TestBackend = NdArray;
 type TrainingBackend = Autodiff<NdArray>;
+type ExpectedInstruction<'a> = (
+    &'a str,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+);
 
 const TOLERANCE: f32 = 1e-6;
 
@@ -299,7 +306,8 @@ fn test_graph_api_simple_inference() {
     let x = ops::dense(4, Activation::Relu, x);
     let output = ops::dense(1, Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -347,7 +355,8 @@ fn test_graph_api_weight_sharing() {
 
     let output = ops::dense(1, Activation::Sigmoid, z);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let export = model.to_instruction_model_info();
@@ -372,7 +381,8 @@ fn test_graph_api_multilayer_deep() {
     let x = ops::dense(4, Activation::Relu, x);
     let output = ops::dense(1, Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -425,7 +435,8 @@ fn test_graph_api_add_operation() {
     let added = ops::add(vec![branch1, branch2]);
     let output = ops::dense(1, Activation::Sigmoid, added);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -480,7 +491,8 @@ fn test_graph_api_multiply_operation() {
     let multiplied = ops::multiply(vec![branch1, branch2]);
     let output = ops::dense(1, Activation::Sigmoid, multiplied);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -535,7 +547,8 @@ fn test_graph_api_residual_connection() {
 
     let output = ops::dense(1, Activation::Sigmoid, residual);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -580,7 +593,8 @@ fn test_sqrt_activation() {
     let x = ops::dense(4, Activation::Sqrt, x);
     let output = ops::dense(1, Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -624,7 +638,8 @@ fn test_log_activation() {
     let x = ops::dense(4, Activation::Log, x);
     let output = ops::dense(1, Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -668,7 +683,8 @@ fn test_log10_activation() {
     let x = ops::dense(4, Activation::Log10, x);
     let output = ops::dense(1, Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -712,7 +728,8 @@ fn test_inverse_activation() {
     let x = ops::dense(4, Activation::Inverse, x);
     let output = ops::dense(1, Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -756,7 +773,8 @@ fn test_tanh_activation() {
     let x = ops::dense(4, Activation::Tanh, x);
     let output = ops::dense(1, Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -801,7 +819,8 @@ fn test_scale_operation_inference() {
     let scaled = ops::scale(vec![2.0, 3.0, 4.0, 5.0], x);
     let output = ops::dense(1, Activation::Sigmoid, scaled);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -844,7 +863,8 @@ fn test_shift_operation_inference() {
     let shifted = ops::shift(vec![0.1, 0.2, 0.3, 0.4], x);
     let output = ops::dense(1, Activation::Sigmoid, shifted);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -889,7 +909,8 @@ fn test_scale_shift_combined_inference() {
     let shifted = ops::shift(vec![1.0, 1.0, 1.0, 1.0], scaled);
     let output = ops::dense(1, Activation::Sigmoid, shifted);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -934,7 +955,8 @@ fn test_batch_norm_inference() {
     let normalized = ops::batch_norm(x);
     let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -978,7 +1000,8 @@ fn test_batch_norm_with_dense_inference() {
     let normalized = ops::batch_norm(hidden);
     let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1021,7 +1044,8 @@ fn test_batch_norm_multiple_inputs() {
     let normalized = ops::batch_norm(x);
     let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1080,7 +1104,8 @@ fn test_batch_norm_preserves_output_for_initial_state() {
     // Use identity-like output (just pass through the normalized values)
     let output = ops::dense(4, Activation::None, normalized);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1127,7 +1152,8 @@ fn test_batch_norm_chained() {
     let n2 = ops::batch_norm(h2);
     let output = ops::dense(1, Activation::Sigmoid, n2);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1173,7 +1199,8 @@ fn test_batch_norm_with_residual() {
     let residual = ops::add(vec![x, normalized]);
     let output = ops::dense(1, Activation::Sigmoid, residual);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1218,7 +1245,8 @@ fn test_batch_norm_different_sizes() {
         let normalized = ops::batch_norm(x);
         let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-        let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        let model = GraphModel::new(vec![input], output)
+            .compile::<TestBackend>(&device)
             .expect("Model creation should succeed");
 
         let json = model
@@ -1275,7 +1303,8 @@ fn test_graph_api_autodiff_no_training() {
     let hidden = ops::dense(8, Activation::Relu, x);
     let output = ops::dense(1, Activation::Sigmoid, hidden);
 
-    let model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1318,7 +1347,8 @@ fn test_graph_api_single_training_step() {
     let hidden = ops::dense(8, Activation::Relu, x);
     let output = ops::dense(1, Activation::Sigmoid, hidden);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -1381,7 +1411,8 @@ fn test_trained_graph_model_export_equivalence_simple() {
     let hidden = ops::dense(8, Activation::Relu, x);
     let output = ops::dense(1, Activation::Sigmoid, hidden);
 
-    let model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1434,7 +1465,8 @@ fn test_trained_graph_model_export_equivalence() {
     // Final output layer
     let output = ops::dense(1, Activation::Sigmoid, concatenated);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -1496,7 +1528,8 @@ fn test_trained_model_with_inverse_activation() {
     let inverted = ops::dense(4, Activation::Inverse, hidden);
     let output = ops::dense(1, Activation::None, inverted);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -1565,7 +1598,8 @@ fn test_trained_model_with_all_activations() {
         let hidden = ops::dense(4, activation, x);
         let output = ops::dense(1, Activation::Sigmoid, hidden);
 
-        let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+        let mut model = GraphModel::new(vec![input], output)
+            .compile::<TrainingBackend>(&device)
             .expect("Model creation should succeed");
 
         let mut optimizer = AdamConfig::new().init();
@@ -1628,7 +1662,8 @@ fn test_trained_fan_in_add_export() {
     let added = ops::add(vec![branch1, branch2]);
     let output = ops::dense(1, Activation::Sigmoid, added);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -1691,7 +1726,8 @@ fn test_trained_model_with_scale_and_inverse() {
     let scaled = ops::scale(vec![-1.0, -1.0, -1.0, -1.0], hidden);
     let output = ops::dense(1, Activation::None, scaled);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -1760,7 +1796,8 @@ fn test_fan_out_multiply_gating() {
 
     let output = ops::dense(1, Activation::Sigmoid, gated);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1815,7 +1852,8 @@ fn test_fan_in_multiply() {
 
     let output = ops::dense(1, Activation::None, multiplied);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1863,7 +1901,8 @@ fn test_triple_fan_out_multiply() {
     let multiplied = ops::multiply(vec![branch1, branch2, branch3]);
     let output = ops::dense(1, Activation::Sigmoid, multiplied);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1918,7 +1957,8 @@ fn test_two_head_multiply_concat() {
 
     let output = ops::concat(vec![head1, head2]);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -1966,7 +2006,8 @@ fn test_batch_norm_scale_only() {
     let normalized = ops::batch_norm_scale_only(x);
     let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -2018,7 +2059,8 @@ fn test_batch_norm_full_config() {
     let normalized = ops::batch_norm_config(1e-3, true, true, x);
     let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -2062,7 +2104,8 @@ fn test_batch_norm_center_only() {
     let normalized = ops::batch_norm_config(1e-3, true, false, x);
     let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -2106,7 +2149,8 @@ fn test_batch_norm_neither() {
     let normalized = ops::batch_norm_config(1e-3, false, false, x);
     let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -2150,7 +2194,8 @@ fn test_batch_norm_scale_only_different_epsilons() {
         let normalized = ops::batch_norm_config(epsilon, false, true, x);
         let output = ops::dense(1, Activation::Sigmoid, normalized);
 
-        let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        let model = GraphModel::new(vec![input], output)
+            .compile::<TestBackend>(&device)
             .expect("Model creation should succeed");
 
         let json = model
@@ -2196,7 +2241,8 @@ fn test_batch_norm_scale_only_with_dense() {
     let hidden = ops::dense(8, Activation::Relu, normalized);
     let output = ops::dense(1, Activation::Sigmoid, hidden);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -2248,7 +2294,8 @@ fn test_batch_norm_with_multiply_gating() {
     let gate = ops::dense(1, Activation::Sigmoid, hidden);
     let output = ops::multiply(vec![linear, gate]);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -2296,7 +2343,8 @@ fn test_trained_fan_out_multiply() {
     let gated = ops::multiply(vec![linear_branch, gate_branch]);
     let output = ops::dense(1, Activation::Sigmoid, gated);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -2356,7 +2404,8 @@ fn test_trained_batch_norm_scale_only() {
     let hidden = ops::dense(8, Activation::Relu, normalized);
     let output = ops::dense(1, Activation::Sigmoid, hidden);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -2432,7 +2481,8 @@ fn test_trained_full_architecture() {
 
     let output = ops::concat(vec![head1, head2]);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -2509,7 +2559,8 @@ fn test_two_head_architecture_training() {
     // Final output layer
     let output = ops::dense(1, Activation::Sigmoid, concatenated);
 
-    let mut model = GraphModel::<TrainingBackend>::new(vec![input], output, &device)
+    let mut model = GraphModel::new(vec![input], output)
+        .compile::<TrainingBackend>(&device)
         .expect("Model creation should succeed");
 
     let mut optimizer = AdamConfig::new().init();
@@ -2568,16 +2619,18 @@ fn test_nested_model() {
 
     let device = <TestBackend as Backend>::Device::default();
 
-    // Build sub-model: BatchNorm + Dense(3) + Dense(3)
+    // Build sub-model graph: BatchNorm + Dense(3) + Dense(3)
     // Equivalent to Python: ff_model([3, 3, 3], NOT_INPLACE, "ll")
     let sub_input = InputBuffer::new(3);
     let normalized = ops::batch_norm(sub_input.buffer());
     let hidden = ops::dense(3, Activation::None, normalized);
     let sub_output = ops::dense(3, Activation::None, hidden);
-    let sub_model = GraphModel::<TestBackend>::new(vec![sub_input], sub_output, &device)
-        .expect("Sub-model creation should succeed");
+    let sub_graph = GraphModel::new(vec![sub_input], sub_output);
 
     // === Test 1: Export sub-model independently ===
+    let sub_model = sub_graph
+        .compile::<TestBackend>(&device)
+        .expect("Sub-model creation should succeed");
     let sub_export = sub_model.to_instruction_model_info();
     assert_eq!(
         sub_export.buffer_sizes,
@@ -2593,13 +2646,14 @@ fn test_nested_model() {
 
     // === Test 2: Build and export final model ===
     let main_input = InputBuffer::new(3);
-    let first_iteration = sub_model.apply_single(main_input.buffer());
-    let second_iteration = sub_model.apply_single(first_iteration.clone());
+    let first_iteration = sub_graph.apply_single(main_input.buffer());
+    let second_iteration = sub_graph.apply_single(first_iteration.clone());
 
     let concat = ops::concat(vec![main_input.buffer(), first_iteration, second_iteration]);
     let final_output = ops::dense(1, Activation::None, concat);
 
-    let final_model = GraphModel::<TestBackend>::new(vec![main_input], final_output, &device)
+    let final_model = GraphModel::new(vec![main_input], final_output)
+        .compile::<TestBackend>(&device)
         .expect("Final model creation should succeed");
 
     // Test forward pass
@@ -2642,13 +2696,7 @@ fn test_nested_model() {
     );
 
     // Verify instruction sequence matches Python exactly
-    let expected_instructions: Vec<(
-        &str,
-        Option<usize>,
-        Option<usize>,
-        Option<usize>,
-        Option<usize>,
-    )> = vec![
+    let expected_instructions: Vec<ExpectedInstruction<'_>> = vec![
         // First sub-model application (BatchNorm + 2 Dense)
         ("COPY", Some(0), Some(1), None, Some(0)), // COPY 0→1, internal_index 0
         ("ADD_ELEMENTWISE", Some(1), None, Some(0), None), // ADD input=1, params=0
@@ -2855,7 +2903,8 @@ fn test_scale_and_shift_inplace() {
     let scaled = ops::scale_inplace(vec![2.0, 0.5, 3.0], input_buffer.buffer());
     let shifted = ops::shift_inplace(vec![1.0, -1.0, 0.0], scaled);
 
-    let model = GraphModel::<TestBackend>::new(vec![input_buffer], shifted, &device)
+    let model = GraphModel::new(vec![input_buffer], shifted)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let export = model.to_instruction_model_info();
@@ -2917,7 +2966,7 @@ fn test_scale_and_shift_inplace() {
     let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
 
     // Expected: [1*2 + 1, 2*0.5 + (-1), 3*3 + 0] = [3, 0, 9]
-    let expected = vec![3.0, 0.0, 9.0];
+    let expected = [3.0, 0.0, 9.0];
     for (i, (got, exp)) in output_data.iter().zip(expected.iter()).enumerate() {
         assert!(
             floats_close(*got, *exp, TOLERANCE),
@@ -2969,7 +3018,8 @@ fn test_scale_and_shift_not_inplace() {
     let scaled = ops::scale(vec![2.0, 3.0], input_buffer.buffer());
     let shifted = ops::shift(vec![10.0, 20.0], scaled);
 
-    let model = GraphModel::<TestBackend>::new(vec![input_buffer], shifted, &device)
+    let model = GraphModel::new(vec![input_buffer], shifted)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let export = model.to_instruction_model_info();
@@ -3048,7 +3098,7 @@ fn test_scale_and_shift_not_inplace() {
     let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
 
     // Expected: [1*2 + 10, 2*3 + 20] = [12, 26]
-    let expected = vec![12.0, 26.0];
+    let expected = [12.0, 26.0];
     for (i, (got, exp)) in output_data.iter().zip(expected.iter()).enumerate() {
         assert!(
             floats_close(*got, *exp, TOLERANCE),
@@ -3095,7 +3145,8 @@ fn test_batch_norm_inplace() {
     let input_buffer = InputBuffer::new(3);
     let normalized = ops::batch_norm_inplace(input_buffer.buffer());
 
-    let model = GraphModel::<TestBackend>::new(vec![input_buffer], normalized, &device)
+    let model = GraphModel::new(vec![input_buffer], normalized)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let export = model.to_instruction_model_info();
@@ -3147,7 +3198,8 @@ fn test_batch_norm_not_inplace() {
     let input_buffer = InputBuffer::new(3);
     let normalized = ops::batch_norm(input_buffer.buffer()); // Default is in_place=false
 
-    let model = GraphModel::<TestBackend>::new(vec![input_buffer], normalized, &device)
+    let model = GraphModel::new(vec![input_buffer], normalized)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let export = model.to_instruction_model_info();
@@ -3213,15 +3265,15 @@ fn test_inplace_produces_same_output_as_not_inplace() {
     {
         let input_inplace = InputBuffer::new(3);
         let output_inplace = ops::scale_inplace(vec![2.0, 3.0, 4.0], input_inplace.buffer());
-        let model_inplace =
-            GraphModel::<TestBackend>::new(vec![input_inplace], output_inplace, &device)
-                .expect("Model creation should succeed");
+        let model_inplace = GraphModel::new(vec![input_inplace], output_inplace)
+            .compile::<TestBackend>(&device)
+            .expect("Model creation should succeed");
 
         let input_not_inplace = InputBuffer::new(3);
         let output_not_inplace = ops::scale(vec![2.0, 3.0, 4.0], input_not_inplace.buffer());
-        let model_not_inplace =
-            GraphModel::<TestBackend>::new(vec![input_not_inplace], output_not_inplace, &device)
-                .expect("Model creation should succeed");
+        let model_not_inplace = GraphModel::new(vec![input_not_inplace], output_not_inplace)
+            .compile::<TestBackend>(&device)
+            .expect("Model creation should succeed");
 
         let test_input = [1.0f32, 2.0, 3.0];
         let tensor_inplace =
@@ -3259,15 +3311,15 @@ fn test_inplace_produces_same_output_as_not_inplace() {
     {
         let input_inplace = InputBuffer::new(3);
         let output_inplace = ops::shift_inplace(vec![10.0, 20.0, 30.0], input_inplace.buffer());
-        let model_inplace =
-            GraphModel::<TestBackend>::new(vec![input_inplace], output_inplace, &device)
-                .expect("Model creation should succeed");
+        let model_inplace = GraphModel::new(vec![input_inplace], output_inplace)
+            .compile::<TestBackend>(&device)
+            .expect("Model creation should succeed");
 
         let input_not_inplace = InputBuffer::new(3);
         let output_not_inplace = ops::shift(vec![10.0, 20.0, 30.0], input_not_inplace.buffer());
-        let model_not_inplace =
-            GraphModel::<TestBackend>::new(vec![input_not_inplace], output_not_inplace, &device)
-                .expect("Model creation should succeed");
+        let model_not_inplace = GraphModel::new(vec![input_not_inplace], output_not_inplace)
+            .compile::<TestBackend>(&device)
+            .expect("Model creation should succeed");
 
         let test_input = [1.0f32, 2.0, 3.0];
         let tensor_inplace =
@@ -3305,15 +3357,15 @@ fn test_inplace_produces_same_output_as_not_inplace() {
     {
         let input_inplace = InputBuffer::new(4);
         let output_inplace = ops::batch_norm_inplace(input_inplace.buffer());
-        let model_inplace =
-            GraphModel::<TestBackend>::new(vec![input_inplace], output_inplace, &device)
-                .expect("Model creation should succeed");
+        let model_inplace = GraphModel::new(vec![input_inplace], output_inplace)
+            .compile::<TestBackend>(&device)
+            .expect("Model creation should succeed");
 
         let input_not_inplace = InputBuffer::new(4);
         let output_not_inplace = ops::batch_norm(input_not_inplace.buffer());
-        let model_not_inplace =
-            GraphModel::<TestBackend>::new(vec![input_not_inplace], output_not_inplace, &device)
-                .expect("Model creation should succeed");
+        let model_not_inplace = GraphModel::new(vec![input_not_inplace], output_not_inplace)
+            .compile::<TestBackend>(&device)
+            .expect("Model creation should succeed");
 
         let test_input = [1.0f32, 2.0, 3.0, 4.0];
         let tensor_inplace =
@@ -3352,16 +3404,16 @@ fn test_inplace_produces_same_output_as_not_inplace() {
         let input_inplace = InputBuffer::new(3);
         let scaled_inplace = ops::scale_inplace(vec![2.0, 3.0, 4.0], input_inplace.buffer());
         let output_inplace = ops::shift_inplace(vec![1.0, 1.0, 1.0], scaled_inplace);
-        let model_inplace =
-            GraphModel::<TestBackend>::new(vec![input_inplace], output_inplace, &device)
-                .expect("Model creation should succeed");
+        let model_inplace = GraphModel::new(vec![input_inplace], output_inplace)
+            .compile::<TestBackend>(&device)
+            .expect("Model creation should succeed");
 
         let input_not_inplace = InputBuffer::new(3);
         let scaled_not_inplace = ops::scale(vec![2.0, 3.0, 4.0], input_not_inplace.buffer());
         let output_not_inplace = ops::shift(vec![1.0, 1.0, 1.0], scaled_not_inplace);
-        let model_not_inplace =
-            GraphModel::<TestBackend>::new(vec![input_not_inplace], output_not_inplace, &device)
-                .expect("Model creation should succeed");
+        let model_not_inplace = GraphModel::new(vec![input_not_inplace], output_not_inplace)
+            .compile::<TestBackend>(&device)
+            .expect("Model creation should succeed");
 
         let test_input = [1.0f32, 2.0, 3.0];
         let tensor_inplace =
@@ -3425,7 +3477,8 @@ fn test_mixed_inplace_operations() {
     let x = ops::shift_inplace(vec![0.5, 0.5, 0.5, 0.5], x); // in_place
     let x = ops::scale(vec![2.0, 2.0, 2.0, 2.0], x); // not in_place
 
-    let model = GraphModel::<TestBackend>::new(vec![input_buffer], x, &device)
+    let model = GraphModel::new(vec![input_buffer], x)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let export = model.to_instruction_model_info();
@@ -3499,7 +3552,7 @@ fn test_mixed_inplace_operations() {
     let output = model.forward(test_input);
     let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
 
-    let expected = vec![3.0, 9.0, 19.0, 33.0];
+    let expected = [3.0, 9.0, 19.0, 33.0];
     for (i, (got, exp)) in output_data.iter().zip(expected.iter()).enumerate() {
         assert!(
             floats_close(*got, *exp, TOLERANCE),
@@ -3523,7 +3576,8 @@ fn test_standalone_activation_sigmoid() {
     // Apply sigmoid activation without a dense layer
     let output = ops::activation(Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     // Test: sigmoid(0) = 0.5
@@ -3549,7 +3603,8 @@ fn test_standalone_activation_relu() {
     let x = input.buffer();
     let output = ops::activation(Activation::Relu, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     // relu([-1, 0, 1, 2]) = [0, 0, 1, 2]
@@ -3557,7 +3612,7 @@ fn test_standalone_activation_relu() {
     let result = model.forward(input_tensor);
     let data: Vec<f32> = result.to_data().to_vec().unwrap();
 
-    let expected = vec![0.0, 0.0, 1.0, 2.0];
+    let expected = [0.0, 0.0, 1.0, 2.0];
     for (i, (got, exp)) in data.iter().zip(expected.iter()).enumerate() {
         assert!(
             floats_close(*got, *exp, TOLERANCE),
@@ -3579,7 +3634,8 @@ fn test_activation_inplace_export() {
     // in_place=true: no COPY instruction in export
     let output = ops::activation_inplace(Activation::Relu, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -3607,7 +3663,8 @@ fn test_activation_not_inplace_export() {
     // in_place=false (default): COPY then ACTIVATION
     let output = ops::activation(Activation::Relu, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -3634,7 +3691,8 @@ fn test_standalone_activation_inference() {
     let x = input.buffer();
     let output = ops::activation(Activation::Sigmoid, x);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     let json = model
@@ -3684,7 +3742,8 @@ fn test_activation_after_concat() {
     let concat = ops::concat(vec![branch1, branch2]);
     let output = ops::activation(Activation::Sigmoid, concat);
 
-    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+    let model = GraphModel::new(vec![input], output)
+        .compile::<TestBackend>(&device)
         .expect("Model creation should succeed");
 
     assert_eq!(model.output_size(), 2);
@@ -3703,4 +3762,66 @@ fn test_activation_after_concat() {
             val
         );
     }
+}
+
+/// Tests that submodel extraction produces correct outputs matching the parent model.
+/// This verifies the weight sharing implementation works correctly.
+#[test]
+fn test_submodel_weight_sharing() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    // Create a sub-graph for buy signal
+    let buy_input = InputBuffer::new(4);
+    let buy_hidden = ops::dense(8, Activation::Relu, buy_input.buffer());
+    let buy_out = ops::dense(1, Activation::Sigmoid, buy_hidden);
+    let buy_graph = GraphModel::new(vec![buy_input], buy_out);
+
+    // Create a sub-graph for sell signal
+    let sell_input = InputBuffer::new(4);
+    let sell_hidden = ops::dense(8, Activation::Relu, sell_input.buffer());
+    let sell_out = ops::dense(1, Activation::Sigmoid, sell_hidden);
+    let sell_graph = GraphModel::new(vec![sell_input], sell_out);
+
+    // Create combined graph using both sub-graphs
+    let main_input = InputBuffer::new(4);
+    let x = main_input.buffer();
+    let buy_result = buy_graph.apply_single(x.clone());
+    let sell_result = sell_graph.apply_single(x);
+    let combined = ops::concat(vec![buy_result, sell_result]);
+    let combined_graph = GraphModel::new(vec![main_input], combined);
+
+    // Compile only the combined graph
+    let compiled = combined_graph
+        .compile::<TestBackend>(&device)
+        .expect("Combined model creation should succeed");
+
+    // Extract sub-models (they use cloned weights from compiled)
+    let buy_model = compiled.submodel(&buy_graph);
+    let sell_model = compiled.submodel(&sell_graph);
+
+    // Test: combined output should equal concatenated sub-model outputs
+    let test_input = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+    let combined_result = compiled.forward(test_input.clone());
+    let buy_result = buy_model.forward(test_input.clone());
+    let sell_result = sell_model.forward(test_input);
+
+    let combined_data: Vec<f32> = combined_result.to_data().to_vec().unwrap();
+    let buy_data: Vec<f32> = buy_result.to_data().to_vec().unwrap();
+    let sell_data: Vec<f32> = sell_result.to_data().to_vec().unwrap();
+
+    // Combined[0] should exactly equal buy output
+    assert!(
+        (combined_data[0] - buy_data[0]).abs() < 1e-6,
+        "Buy weight sharing failed: {} != {}",
+        combined_data[0],
+        buy_data[0]
+    );
+
+    // Combined[1] should exactly equal sell output
+    assert!(
+        (combined_data[1] - sell_data[0]).abs() < 1e-6,
+        "Sell weight sharing failed: {} != {}",
+        combined_data[1],
+        sell_data[0]
+    );
 }

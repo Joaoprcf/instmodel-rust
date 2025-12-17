@@ -25,12 +25,14 @@ pub enum Producer {
     /// During compilation, this is expanded by remapping the sub-graph's
     /// input buffer IDs to the actual input buffer indices.
     SubGraph {
-        /// Unique ID for this sub-graph (used for weight sharing)
+        /// Unique ID for this sub-graph application (used for weight sharing)
         id: OpId,
         /// Original InputBuffer IDs from the sub-model (in order)
         input_ids: Vec<BufferId>,
         /// The output buffer carrying the sub-graph structure
         output: Box<DataBuffer>,
+        /// ID of the ModelGraph this sub-graph came from (for submodel extraction)
+        graph_id: usize,
     },
 }
 

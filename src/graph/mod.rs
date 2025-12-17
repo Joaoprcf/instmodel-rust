@@ -13,33 +13,25 @@
 //! type TestBackend = NdArray;
 //! let device = <TestBackend as Backend>::Device::default();
 //!
-//! // Create input
+//! // Create input and build graph (no device needed)
 //! let input = InputBuffer::new(4);
-//!
-//! // Build graph using convenience functions
 //! let x = input.buffer();
 //! let hidden = ops::dense(8, Activation::Relu, x.clone());
 //! let output = ops::dense(1, Activation::Sigmoid, hidden);
+//! let graph = ModelGraph::new(vec![input], output);
 //!
-//! // Create model (layers initialized here)
-//! let model = ModelGraph::<TestBackend>::new(vec![input], output, &device).unwrap();
-//!
-//! // Example with branching and Add
-//! let input2 = InputBuffer::new(4);
-//! let x2 = input2.buffer();
-//! let branch1 = ops::dense(4, Activation::Relu, x2.clone());
-//! let branch2 = ops::dense(4, Activation::Relu, x2);
-//! let merged = ops::add(vec![branch1, branch2]);
-//! let output2 = ops::dense(1, Activation::Sigmoid, merged);
-//! let model2 = ModelGraph::<TestBackend>::new(vec![input2], output2, &device).unwrap();
+//! // Compile to create weights on device
+//! let model = graph.compile::<TestBackend>(&device).unwrap();
 //! ```
 
 mod buffer;
 mod compile;
+mod core;
 mod model;
 mod operation;
 
 pub use buffer::{BufferId, DataBuffer, InputBuffer, Producer};
 pub use compile::{CompileContext, InstructionExport, InstructionModelExport};
-pub use model::ModelGraph;
+pub use core::{GraphId, ModelGraph};
+pub use model::{CompiledModel, SubModel};
 pub use operation::{OpId, Operation, ops};
