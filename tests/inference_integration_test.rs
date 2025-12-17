@@ -3510,3 +3510,197 @@ fn test_mixed_inplace_operations() {
         );
     }
 }
+
+// ==================== Standalone Activation Tests ====================
+
+/// Test standalone activation with sigmoid (in_place=false by default)
+#[test]
+fn test_standalone_activation_sigmoid() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    // Apply sigmoid activation without a dense layer
+    let output = ops::activation(Activation::Sigmoid, x);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    // Test: sigmoid(0) = 0.5
+    let input_tensor = Tensor::<TestBackend, 2>::from_floats([[0.0, 0.0, 0.0, 0.0]], &device);
+    let result = model.forward(input_tensor);
+    let data: Vec<f32> = result.to_data().to_vec().unwrap();
+
+    for val in &data {
+        assert!(
+            floats_close(*val, 0.5, TOLERANCE),
+            "sigmoid(0) should be 0.5, got {}",
+            val
+        );
+    }
+}
+
+/// Test standalone activation with relu
+#[test]
+fn test_standalone_activation_relu() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let output = ops::activation(Activation::Relu, x);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    // relu([-1, 0, 1, 2]) = [0, 0, 1, 2]
+    let input_tensor = Tensor::<TestBackend, 2>::from_floats([[-1.0, 0.0, 1.0, 2.0]], &device);
+    let result = model.forward(input_tensor);
+    let data: Vec<f32> = result.to_data().to_vec().unwrap();
+
+    let expected = vec![0.0, 0.0, 1.0, 2.0];
+    for (i, (got, exp)) in data.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            floats_close(*got, *exp, TOLERANCE),
+            "relu mismatch at {}: got {}, expected {}",
+            i,
+            got,
+            exp
+        );
+    }
+}
+
+/// Test standalone activation in-place export (no COPY instruction)
+#[test]
+fn test_activation_inplace_export() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    // in_place=true: no COPY instruction in export
+    let output = ops::activation_inplace(Activation::Relu, x);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    // Should have ACTIVATION but no COPY
+    assert!(
+        json.contains("ACTIVATION"),
+        "Should have ACTIVATION instruction"
+    );
+    assert!(
+        !json.contains("COPY"),
+        "In-place should not have COPY instruction"
+    );
+}
+
+/// Test standalone activation NOT in-place export (has COPY instruction)
+#[test]
+fn test_activation_not_inplace_export() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    // in_place=false (default): COPY then ACTIVATION
+    let output = ops::activation(Activation::Relu, x);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    // Should have both COPY and ACTIVATION
+    assert!(
+        json.contains("COPY"),
+        "Not in-place should have COPY instruction"
+    );
+    assert!(
+        json.contains("ACTIVATION"),
+        "Should have ACTIVATION instruction"
+    );
+}
+
+/// Test standalone activation with inference engine
+#[test]
+fn test_standalone_activation_inference() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+    let output = ops::activation(Activation::Sigmoid, x);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    let json = model
+        .export_to_instruction_model()
+        .expect("Export should succeed");
+
+    let model_info: InstructionModelInfo =
+        serde_json::from_str(&json).expect("JSON should be valid");
+    let inference_model =
+        InstructionModel::new(model_info).expect("Inference model creation should succeed");
+
+    // Compare burn and inference outputs
+    let test_inputs = vec![0.0f32, 1.0, -1.0, 2.0];
+    let input_tensor =
+        Tensor::<TestBackend, 1>::from_floats(test_inputs.as_slice(), &device).reshape([1, 4]);
+
+    let burn_output = model.forward(input_tensor);
+    let burn_result: Vec<f32> = burn_output.to_data().to_vec().unwrap();
+
+    let inference_result = inference_model
+        .predict(&test_inputs)
+        .expect("Inference should succeed");
+
+    for (burn_val, inference_val) in burn_result.iter().zip(inference_result.iter()) {
+        assert!(
+            floats_close(*burn_val, *inference_val, TOLERANCE),
+            "Standalone activation mismatch: burn={}, inference={}",
+            burn_val,
+            inference_val
+        );
+    }
+}
+
+/// Test activation after dense (common pattern: concat branches then sigmoid)
+#[test]
+fn test_activation_after_concat() {
+    let device = <TestBackend as Backend>::Device::default();
+
+    let input = InputBuffer::new(4);
+    let x = input.buffer();
+
+    // Two branches
+    let branch1 = ops::dense(1, Activation::None, x.clone());
+    let branch2 = ops::dense(1, Activation::None, x);
+
+    // Concat then apply sigmoid
+    let concat = ops::concat(vec![branch1, branch2]);
+    let output = ops::activation(Activation::Sigmoid, concat);
+
+    let model = GraphModel::<TestBackend>::new(vec![input], output, &device)
+        .expect("Model creation should succeed");
+
+    assert_eq!(model.output_size(), 2);
+
+    let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+    let result = model.forward(input_tensor);
+
+    assert_eq!(result.dims(), [1, 2]);
+
+    // Output should be sigmoid-bounded (0, 1)
+    let data: Vec<f32> = result.to_data().to_vec().unwrap();
+    for val in &data {
+        assert!(
+            *val > 0.0 && *val < 1.0,
+            "Sigmoid output should be in (0, 1), got {}",
+            val
+        );
+    }
+}

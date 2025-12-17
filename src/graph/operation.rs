@@ -62,6 +62,14 @@ pub enum Operation {
         scale: bool,
         in_place: bool,
     },
+    /// Standalone activation function (no learnable weights).
+    /// - in_place: if true, operates directly on input buffer (no COPY)
+    /// - in_place: if false (default), creates a copy first, preserving original
+    StandaloneActivation {
+        id: OpId,
+        activation: Activation,
+        in_place: bool,
+    },
 }
 
 impl Operation {
@@ -161,6 +169,21 @@ impl Operation {
         Self::batch_norm(epsilon, false, true)
     }
 
+    /// Creates a new standalone activation operation (no learnable weights).
+    /// Default: in_place=false (creates new buffer with COPY)
+    pub fn standalone_activation(activation: Activation) -> Self {
+        Self::standalone_activation_with_inplace(activation, false)
+    }
+
+    /// Creates a new standalone activation operation with explicit in_place setting.
+    pub fn standalone_activation_with_inplace(activation: Activation, in_place: bool) -> Self {
+        Self::StandaloneActivation {
+            id: next_op_id(),
+            activation,
+            in_place,
+        }
+    }
+
     /// Returns the unique ID of this operation.
     pub fn id(&self) -> OpId {
         match self {
@@ -172,6 +195,7 @@ impl Operation {
             Self::Scale { id, .. } => *id,
             Self::Shift { id, .. } => *id,
             Self::BatchNorm { id, .. } => *id,
+            Self::StandaloneActivation { id, .. } => *id,
         }
     }
 
@@ -185,6 +209,7 @@ impl Operation {
             Self::Scale { vector, .. } => vector.len(),
             Self::Shift { vector, .. } => vector.len(),
             Self::BatchNorm { .. } => input_sizes[0],
+            Self::StandaloneActivation { .. } => input_sizes[0],
         }
     }
 
@@ -457,6 +482,40 @@ pub mod ops {
     ) -> DataBuffer {
         Operation::batch_norm_with_inplace(epsilon, center, scale, true).apply(input)
     }
+
+    /// Applies a standalone activation function (no learnable weights).
+    /// Default: in_place=false (creates new buffer with COPY, preserving original)
+    ///
+    /// # Example
+    /// ```
+    /// use instmodel::graph::{InputBuffer, ops};
+    /// use instmodel::layers::Activation;
+    ///
+    /// let input = InputBuffer::new(4);
+    /// let logits = ops::dense(3, Activation::None, input.buffer());
+    /// let probs = ops::activation(Activation::Sigmoid, logits);
+    /// assert_eq!(probs.size(), 3);
+    /// ```
+    pub fn activation(act: Activation, input: DataBuffer) -> DataBuffer {
+        Operation::standalone_activation(act).apply(input)
+    }
+
+    /// Applies a standalone activation function in-place (no COPY).
+    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
+    ///
+    /// # Example
+    /// ```
+    /// use instmodel::graph::{InputBuffer, ops};
+    /// use instmodel::layers::Activation;
+    ///
+    /// let input = InputBuffer::new(4);
+    /// let logits = ops::dense(3, Activation::None, input.buffer());
+    /// let probs = ops::activation_inplace(Activation::Sigmoid, logits);
+    /// assert_eq!(probs.size(), 3);
+    /// ```
+    pub fn activation_inplace(act: Activation, input: DataBuffer) -> DataBuffer {
+        Operation::standalone_activation_with_inplace(act, true).apply(input)
+    }
 }
 
 impl Operation {
@@ -614,6 +673,39 @@ impl Operation {
                 panic!(
                     "BatchNorm must be compiled with compile_batch_norm to include trained parameters"
                 );
+            }
+            Self::StandaloneActivation {
+                activation,
+                in_place,
+                ..
+            } => {
+                let target_index = if *in_place {
+                    // in_place=true: operate directly on input buffer (no COPY, no new buffer)
+                    input_indices[0]
+                } else {
+                    // in_place=false: allocate new buffer and copy input
+                    let output_size = ctx.buffer_sizes[input_indices[0]];
+                    let output_index = ctx.allocate_buffer(output_size);
+                    let copy_instruction = InstructionExport::Copy {
+                        input: input_indices[0],
+                        output: output_index,
+                        internal_index: 0,
+                    };
+                    ctx.add_instruction(copy_instruction);
+                    output_index
+                };
+
+                // Apply activation to target buffer
+                let activation_instruction = InstructionExport::Activation {
+                    input: target_index,
+                    activation: activation
+                        .to_instruction_name()
+                        .unwrap_or("NONE")
+                        .to_string(),
+                };
+                ctx.add_instruction(activation_instruction);
+
+                target_index
             }
         }
     }

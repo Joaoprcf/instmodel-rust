@@ -225,6 +225,11 @@ enum Step {
         input: BufferId,
         output: BufferId,
     },
+    StandaloneActivation {
+        input: BufferId,
+        output: BufferId,
+        activation: Activation,
+    },
 }
 
 /// Metadata for export: maps layer indices back to OpIds for weight export.
@@ -393,6 +398,16 @@ impl<B: Backend> ModelGraph<B> {
                     let out_idx = self.buffer_index.0[output];
                     let layer = &self.batch_norm_layers[*layer_index];
                     let result = layer.forward(buffers[&in_idx].clone());
+                    buffers.insert(out_idx, result);
+                }
+                Step::StandaloneActivation {
+                    input,
+                    output,
+                    activation,
+                } => {
+                    let in_idx = self.buffer_index.0[input];
+                    let out_idx = self.buffer_index.0[output];
+                    let result = activation.apply(buffers[&in_idx].clone());
                     buffers.insert(out_idx, result);
                 }
             }
@@ -791,6 +806,13 @@ impl GraphBuilder {
                     output: buffer.id(),
                 });
             }
+            Operation::StandaloneActivation { activation, .. } => {
+                self.steps.push(Step::StandaloneActivation {
+                    input: inputs[0].id(),
+                    output: buffer.id(),
+                    activation: *activation,
+                });
+            }
         }
     }
 
@@ -1019,6 +1041,13 @@ impl GraphBuilder {
                     layer_index,
                     input: input_ids[0],
                     output: new_output_id,
+                });
+            }
+            Operation::StandaloneActivation { activation, .. } => {
+                self.steps.push(Step::StandaloneActivation {
+                    input: input_ids[0],
+                    output: new_output_id,
+                    activation: *activation,
                 });
             }
         }
