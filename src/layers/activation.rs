@@ -29,6 +29,8 @@ pub enum Activation {
     Log10,
     /// Complement: f(x) = 1 - x
     Inverse,
+    /// Gaussian Error Linear Unit: f(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+    Gelu,
 }
 
 impl Activation {
@@ -66,6 +68,7 @@ impl Activation {
                 // 1 - x
                 tensor.neg() + 1.0
             }
+            Activation::Gelu => burn::tensor::activation::gelu(tensor),
         }
     }
 
@@ -81,6 +84,7 @@ impl Activation {
             Activation::Log => Some("LOG"),
             Activation::Log10 => Some("LOG10"),
             Activation::Inverse => Some("INVERSE"),
+            Activation::Gelu => Some("GELU"),
         }
     }
 
@@ -96,6 +100,7 @@ impl Activation {
             "LOG" => Some(Activation::Log),
             "LOG10" => Some(Activation::Log10),
             "INVERSE" => Some(Activation::Inverse),
+            "GELU" => Some(Activation::Gelu),
             _ => None,
         }
     }
@@ -112,6 +117,7 @@ impl Activation {
             Activation::Log => 6,
             Activation::Log10 => 7,
             Activation::Inverse => 8,
+            Activation::Gelu => 9,
         }
     }
 
@@ -127,6 +133,7 @@ impl Activation {
             6 => Activation::Log,
             7 => Activation::Log10,
             8 => Activation::Inverse,
+            9 => Activation::Gelu,
             _ => Activation::None,
         }
     }
@@ -150,6 +157,7 @@ mod tests {
         assert_eq!(Activation::Log.to_instruction_name(), Some("LOG"));
         assert_eq!(Activation::Log10.to_instruction_name(), Some("LOG10"));
         assert_eq!(Activation::Inverse.to_instruction_name(), Some("INVERSE"));
+        assert_eq!(Activation::Gelu.to_instruction_name(), Some("GELU"));
     }
 
     #[test]
@@ -160,6 +168,8 @@ mod tests {
         assert_eq!(Activation::from_name("LOG"), Some(Activation::Log));
         assert_eq!(Activation::from_name("log10"), Some(Activation::Log10));
         assert_eq!(Activation::from_name("INVERSE"), Some(Activation::Inverse));
+        assert_eq!(Activation::from_name("gelu"), Some(Activation::Gelu));
+        assert_eq!(Activation::from_name("GELU"), Some(Activation::Gelu));
         assert_eq!(Activation::from_name("invalid"), None);
     }
 
@@ -175,6 +185,7 @@ mod tests {
             Activation::Log,
             Activation::Log10,
             Activation::Inverse,
+            Activation::Gelu,
         ];
         for act in activations {
             assert_eq!(Activation::from_id(act.to_id()), act);
@@ -240,5 +251,22 @@ mod tests {
         assert!((result[2] - 0.0).abs() < 1e-5);
         assert!((result[3] - 1.5).abs() < 1e-5);
         assert!((result[4] - (-1.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_gelu_activation() {
+        use burn::tensor::backend::Backend;
+        let device = <TestBackend as Backend>::Device::default();
+        // GeLU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+        // Expected values computed from TensorFlow/NumPy
+        let input = Tensor::<TestBackend, 1>::from_floats([-2.0, -1.0, 0.0, 1.0, 2.0], &device);
+        let output = Activation::Gelu.apply(input);
+        let result: Vec<f32> = output.to_data().to_vec().unwrap();
+        // GeLU(-2) ≈ -0.0454, GeLU(-1) ≈ -0.1587, GeLU(0) = 0, GeLU(1) ≈ 0.8413, GeLU(2) ≈ 1.9545
+        assert!((result[0] - (-0.0454)).abs() < 1e-3);
+        assert!((result[1] - (-0.1587)).abs() < 1e-3);
+        assert!((result[2] - 0.0).abs() < 1e-5);
+        assert!((result[3] - 0.8413).abs() < 1e-3);
+        assert!((result[4] - 1.9545).abs() < 1e-3);
     }
 }
