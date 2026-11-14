@@ -1,8 +1,5 @@
-//! Model-related error types.
-
 use thiserror::Error;
 
-/// Errors that can occur during model operations.
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error("Model has no layers defined")]

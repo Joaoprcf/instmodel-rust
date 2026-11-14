@@ -1,15 +1,12 @@
-//! Compilation context for converting the graph to instruction model format.
-
 use std::collections::HashMap;
 
 use super::buffer::BufferId;
 use super::operation::OpId;
 
-/// Export format for instructions.
+/// One instruction of the exported JSON model.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum InstructionExport {
-    /// Dense/Dot product instruction.
     #[serde(rename = "DOT")]
     Dot {
         input: usize,
@@ -18,123 +15,87 @@ pub enum InstructionExport {
         #[serde(skip_serializing_if = "Option::is_none")]
         activation: Option<String>,
     },
-    /// Copy with column selection.
     #[serde(rename = "COPY_MASKED")]
     CopyMasked {
         input: usize,
         output: usize,
         indexes: Vec<usize>,
     },
-    /// Copy entire buffer.
+    /// Copies the whole input into `output` starting at `internal_index`.
     #[serde(rename = "COPY")]
     Copy {
         input: usize,
         output: usize,
         internal_index: usize,
     },
-    /// Element-wise add of multiple buffers.
     #[serde(rename = "ADD_ELEMENTWISE_BUFFERS")]
     AddBuffers { input: Vec<usize>, output: usize },
-    /// Element-wise multiply of multiple buffers.
     #[serde(rename = "MULTIPLY_ELEMENTWISE_BUFFERS")]
     MultiplyBuffers { input: Vec<usize>, output: usize },
-    /// Activation function applied to a buffer (in-place).
+    /// In-place.
     #[serde(rename = "ACTIVATION")]
     Activation { input: usize, activation: String },
-    /// Element-wise multiply by a parameter vector (in-place).
+    /// In-place multiply by `parameters[parameters]`.
     #[serde(rename = "MUL_ELEMENTWISE")]
     MulElementwise { input: usize, parameters: usize },
-    /// Element-wise add a parameter vector (in-place).
+    /// In-place add of `parameters[parameters]`.
     #[serde(rename = "ADD_ELEMENTWISE")]
     AddElementwise { input: usize, parameters: usize },
 }
 
-/// Context for compiling the graph to instruction model format.
-///
-/// This is similar to Python's `model_structure` + `weights_visited` combined.
+/// Accumulates buffers, instructions and deduplicated weights/parameters during export.
+#[derive(Default)]
 pub struct CompileContext {
-    /// Sizes of each buffer in the computation.
     pub buffer_sizes: Vec<usize>,
-    /// List of instructions to execute.
     pub instructions: Vec<InstructionExport>,
-    /// Weight matrices (shape: [output, input] per layer).
+    /// `[output][input]` per Dense layer.
     pub weights: Vec<Vec<Vec<f32>>>,
-    /// Bias vectors.
     pub bias: Vec<Vec<f32>>,
-    /// Parameter vectors (for Scale/Shift operations).
     pub parameters: Vec<Vec<f32>>,
-    /// Maps buffer IDs to their index in buffer_sizes.
     pub visited_buffers: HashMap<BufferId, usize>,
-    /// Maps op IDs to their weight index (for weight sharing).
+    /// Dense op → weight index (shared ops reuse it).
     pub visited_ops: HashMap<OpId, usize>,
-    /// Maps op IDs to their parameter index (for Scale/Shift).
+    /// Scale/Shift/BatchNorm op → first parameter index.
     pub visited_param_ops: HashMap<OpId, usize>,
-    /// Feature names for input buffers.
     pub features: Vec<String>,
 }
 
 impl CompileContext {
-    /// Creates a new empty compile context.
     pub fn new() -> Self {
-        Self {
-            buffer_sizes: Vec::new(),
-            instructions: Vec::new(),
-            weights: Vec::new(),
-            bias: Vec::new(),
-            parameters: Vec::new(),
-            visited_buffers: HashMap::new(),
-            visited_ops: HashMap::new(),
-            visited_param_ops: HashMap::new(),
-            features: Vec::new(),
-        }
+        Self::default()
     }
 
-    /// Registers an input buffer, returning its buffer index.
     pub fn register_input(
         &mut self,
         buffer_id: BufferId,
         size: usize,
         features: Option<&[String]>,
     ) -> usize {
-        let idx = self.buffer_sizes.len();
-        self.buffer_sizes.push(size);
+        let idx = self.allocate_buffer(size);
         self.visited_buffers.insert(buffer_id, idx);
-
         if let Some(feats) = features {
-            self.features.extend(feats.iter().cloned());
+            self.features.extend_from_slice(feats);
         }
-
         idx
     }
 
-    /// Allocates a new output buffer, returning its index.
     pub fn allocate_buffer(&mut self, size: usize) -> usize {
-        let idx = self.buffer_sizes.len();
         self.buffer_sizes.push(size);
-        idx
+        self.buffer_sizes.len() - 1
     }
 
-    /// Checks if an operation's weights have already been stored.
-    /// Returns the weight index if so.
     pub fn get_weight_index(&self, op_id: OpId) -> Option<usize> {
         self.visited_ops.get(&op_id).copied()
     }
 
-    /// Gets existing weight index or creates a placeholder for later filling.
-    /// Used during compilation when weights will be filled by ModelGraph.
+    /// Returns the op's weight index, reserving an empty slot if it has none yet.
     pub fn get_or_create_weight_index(&mut self, op_id: OpId) -> usize {
-        if let Some(idx) = self.visited_ops.get(&op_id) {
-            return *idx;
+        match self.get_weight_index(op_id) {
+            Some(idx) => idx,
+            None => self.store_weights(op_id, vec![], vec![]),
         }
-        // Create placeholder - will be filled by ModelGraph
-        let idx = self.weights.len();
-        self.weights.push(vec![]);
-        self.bias.push(vec![]);
-        self.visited_ops.insert(op_id, idx);
-        idx
     }
 
-    /// Stores weights for an operation and returns the weight index.
     pub fn store_weights(&mut self, op_id: OpId, weights: Vec<Vec<f32>>, bias: Vec<f32>) -> usize {
         let idx = self.weights.len();
         self.weights.push(weights);
@@ -143,36 +104,25 @@ impl CompileContext {
         idx
     }
 
-    /// Updates weights at a given index (for filling placeholders).
     pub fn set_weights(&mut self, index: usize, weights: Vec<Vec<f32>>, bias: Vec<f32>) {
         self.weights[index] = weights;
         self.bias[index] = bias;
     }
 
-    /// Gets existing parameter index or stores new parameters.
     pub fn get_or_store_parameters(&mut self, op_id: OpId, params: &[f32]) -> usize {
-        if let Some(&idx) = self.visited_param_ops.get(&op_id) {
-            return idx;
-        }
-        let idx = self.parameters.len();
-        self.parameters.push(params.to_vec());
-        self.visited_param_ops.insert(op_id, idx);
-        idx
+        *self.visited_param_ops.entry(op_id).or_insert_with(|| {
+            self.parameters.push(params.to_vec());
+            self.parameters.len() - 1
+        })
     }
 
-    /// Adds an instruction to the list.
     pub fn add_instruction(&mut self, instruction: InstructionExport) {
         self.instructions.push(instruction);
     }
 
-    /// Converts the context into the export format.
     pub fn into_export(self) -> InstructionModelExport {
         InstructionModelExport {
-            features: if self.features.is_empty() {
-                None
-            } else {
-                Some(self.features)
-            },
+            features: (!self.features.is_empty()).then_some(self.features),
             feature_size: Some(self.buffer_sizes.first().copied().unwrap_or(0)),
             buffer_sizes: self.buffer_sizes,
             instructions: self.instructions,
@@ -183,13 +133,7 @@ impl CompileContext {
     }
 }
 
-impl Default for CompileContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Export format for the complete instruction model.
+/// The complete exported model (serialises to the shared instruction-model JSON).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InstructionModelExport {
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1,7 +1,3 @@
-//! Operations for the computation graph.
-//!
-//! Uses a simple enum instead of trait objects for clarity.
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::layers::Activation;
@@ -9,52 +5,48 @@ use crate::layers::Activation;
 use super::buffer::DataBuffer;
 use super::compile::{CompileContext, InstructionExport};
 
-/// Unique identifier for an operation.
+/// Unique identifier for an operation; applying the same `Operation` twice shares its weights.
 pub type OpId = usize;
 
-/// Global counter for unique operation IDs.
 static OP_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Generates a new unique operation ID.
-pub fn next_op_id() -> OpId {
+pub(crate) fn next_op_id() -> OpId {
     OP_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
-/// A computation operation in the graph.
+/// A computation operation in the graph. `in_place` ops mutate their input buffer instead of copying it.
 #[derive(Debug, Clone)]
 pub enum Operation {
-    /// Dense (fully connected) layer.
     Dense {
         id: OpId,
         output_size: usize,
         activation: Activation,
     },
-    /// Element-wise addition of buffers.
-    Add { id: OpId },
-    /// Element-wise multiplication of buffers.
-    Multiply { id: OpId },
-    /// Concatenate buffers along feature dimension.
-    Concat { id: OpId },
-    /// Softmax activation (operates across entire buffer).
-    Softmax { id: OpId },
-    /// Element-wise multiply by a fixed parameter vector.
-    /// - in_place: if true, operates directly on input buffer (no COPY)
+    Add {
+        id: OpId,
+    },
+    Multiply {
+        id: OpId,
+    },
+    Concat {
+        id: OpId,
+    },
+    Softmax {
+        id: OpId,
+    },
+    /// Element-wise multiply by a fixed vector.
     Scale {
         id: OpId,
         vector: Vec<f32>,
         in_place: bool,
     },
-    /// Element-wise add a fixed parameter vector.
-    /// - in_place: if true, operates directly on input buffer (no COPY)
+    /// Element-wise add a fixed vector.
     Shift {
         id: OpId,
         vector: Vec<f32>,
         in_place: bool,
     },
-    /// Batch normalization layer with trainable parameters.
-    /// - center: if true, learn beta (bias); if false, beta=0
-    /// - scale: if true, learn gamma; if false, gamma=1
-    /// - in_place: if true, operates directly on input buffer (no COPY)
+    /// `center`: learn beta (else 0); `scale`: learn gamma (else 1).
     BatchNorm {
         id: OpId,
         epsilon: f32,
@@ -62,9 +54,6 @@ pub enum Operation {
         scale: bool,
         in_place: bool,
     },
-    /// Standalone activation function (no learnable weights).
-    /// - in_place: if true, operates directly on input buffer (no COPY)
-    /// - in_place: if false (default), creates a copy first, preserving original
     StandaloneActivation {
         id: OpId,
         activation: Activation,
@@ -73,7 +62,6 @@ pub enum Operation {
 }
 
 impl Operation {
-    /// Creates a new Dense operation.
     pub fn dense(output_size: usize, activation: Activation) -> Self {
         Self::Dense {
             id: next_op_id(),
@@ -82,33 +70,26 @@ impl Operation {
         }
     }
 
-    /// Creates a new Add operation.
     pub fn add() -> Self {
         Self::Add { id: next_op_id() }
     }
 
-    /// Creates a new Multiply operation.
     pub fn multiply() -> Self {
         Self::Multiply { id: next_op_id() }
     }
 
-    /// Creates a new Concat operation.
     pub fn concat() -> Self {
         Self::Concat { id: next_op_id() }
     }
 
-    /// Creates a new Softmax operation.
     pub fn softmax() -> Self {
         Self::Softmax { id: next_op_id() }
     }
 
-    /// Creates a new Scale operation (element-wise multiply by fixed vector).
-    /// Default: in_place=false (creates new buffer with COPY)
     pub fn scale(vector: Vec<f32>) -> Self {
         Self::scale_with_inplace(vector, false)
     }
 
-    /// Creates a new Scale operation with explicit in_place setting.
     pub fn scale_with_inplace(vector: Vec<f32>, in_place: bool) -> Self {
         Self::Scale {
             id: next_op_id(),
@@ -117,13 +98,10 @@ impl Operation {
         }
     }
 
-    /// Creates a new Shift operation (element-wise add fixed vector).
-    /// Default: in_place=false (creates new buffer with COPY)
     pub fn shift(vector: Vec<f32>) -> Self {
         Self::shift_with_inplace(vector, false)
     }
 
-    /// Creates a new Shift operation with explicit in_place setting.
     pub fn shift_with_inplace(vector: Vec<f32>, in_place: bool) -> Self {
         Self::Shift {
             id: next_op_id(),
@@ -132,16 +110,10 @@ impl Operation {
         }
     }
 
-    /// Creates a new BatchNorm operation with trainable parameters.
-    /// - center: if true, learn beta; if false, beta=0
-    /// - scale: if true, learn gamma; if false, gamma=1
-    ///
-    /// Default: in_place=false (creates new buffer with COPY)
     pub fn batch_norm(epsilon: f32, center: bool, scale: bool) -> Self {
         Self::batch_norm_with_inplace(epsilon, center, scale, false)
     }
 
-    /// Creates a new BatchNorm operation with explicit in_place setting.
     pub fn batch_norm_with_inplace(
         epsilon: f32,
         center: bool,
@@ -157,25 +129,19 @@ impl Operation {
         }
     }
 
-    /// Creates a new BatchNorm operation with default epsilon (1e-3) and both center and scale enabled.
-    /// Default: in_place=false
+    /// epsilon = 1e-3, center and scale enabled.
     pub fn batch_norm_default() -> Self {
         Self::batch_norm(1e-3, true, true)
     }
 
-    /// Creates a new BatchNorm operation with scale only (no centering beta).
-    /// Default: in_place=false
     pub fn batch_norm_scale_only(epsilon: f32) -> Self {
         Self::batch_norm(epsilon, false, true)
     }
 
-    /// Creates a new standalone activation operation (no learnable weights).
-    /// Default: in_place=false (creates new buffer with COPY)
     pub fn standalone_activation(activation: Activation) -> Self {
         Self::standalone_activation_with_inplace(activation, false)
     }
 
-    /// Creates a new standalone activation operation with explicit in_place setting.
     pub fn standalone_activation_with_inplace(activation: Activation, in_place: bool) -> Self {
         Self::StandaloneActivation {
             id: next_op_id(),
@@ -184,490 +150,118 @@ impl Operation {
         }
     }
 
-    /// Returns the unique ID of this operation.
     pub fn id(&self) -> OpId {
         match self {
-            Self::Dense { id, .. } => *id,
-            Self::Add { id } => *id,
-            Self::Multiply { id } => *id,
-            Self::Concat { id } => *id,
-            Self::Softmax { id } => *id,
-            Self::Scale { id, .. } => *id,
-            Self::Shift { id, .. } => *id,
-            Self::BatchNorm { id, .. } => *id,
-            Self::StandaloneActivation { id, .. } => *id,
+            Self::Dense { id, .. }
+            | Self::Add { id }
+            | Self::Multiply { id }
+            | Self::Concat { id }
+            | Self::Softmax { id }
+            | Self::Scale { id, .. }
+            | Self::Shift { id, .. }
+            | Self::BatchNorm { id, .. }
+            | Self::StandaloneActivation { id, .. } => *id,
         }
     }
 
-    /// Returns the output size for this operation given input sizes.
     pub fn output_size(&self, input_sizes: &[usize]) -> usize {
         match self {
             Self::Dense { output_size, .. } => *output_size,
-            Self::Add { .. } | Self::Multiply { .. } => input_sizes[0],
             Self::Concat { .. } => input_sizes.iter().sum(),
-            Self::Softmax { .. } => input_sizes[0],
-            Self::Scale { vector, .. } => vector.len(),
-            Self::Shift { vector, .. } => vector.len(),
-            Self::BatchNorm { .. } => input_sizes[0],
-            Self::StandaloneActivation { .. } => input_sizes[0],
+            Self::Scale { vector, .. } | Self::Shift { vector, .. } => vector.len(),
+            Self::Add { .. }
+            | Self::Multiply { .. }
+            | Self::Softmax { .. }
+            | Self::BatchNorm { .. }
+            | Self::StandaloneActivation { .. } => input_sizes[0],
         }
     }
 
-    /// Applies this operation to an input buffer, returning a new DataBuffer.
     pub fn apply(&self, input: DataBuffer) -> DataBuffer {
-        let output_size = self.output_size(&[input.size()]);
-        DataBuffer::new(output_size, Some(self.clone()), vec![input])
+        self.apply_multi(vec![input])
     }
 
-    /// Applies this operation to multiple input buffers.
     pub fn apply_multi(&self, inputs: Vec<DataBuffer>) -> DataBuffer {
-        let input_sizes: Vec<usize> = inputs.iter().map(|b| b.size()).collect();
-        let output_size = self.output_size(&input_sizes);
-        DataBuffer::new(output_size, Some(self.clone()), inputs)
-    }
-}
-
-/// Convenience functions for creating operations and applying them in one step.
-/// These provide a Python-like API.
-pub mod ops {
-    use super::*;
-
-    /// Creates a Dense layer and applies it to the input.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    /// use instmodel::layers::Activation;
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let output = ops::dense(8, Activation::Relu, input.buffer());
-    /// assert_eq!(output.size(), 8);
-    /// ```
-    pub fn dense(output_size: usize, activation: Activation, input: DataBuffer) -> DataBuffer {
-        Operation::dense(output_size, activation).apply(input)
+        let sizes: Vec<usize> = inputs.iter().map(DataBuffer::size).collect();
+        DataBuffer::new(self.output_size(&sizes), Some(self.clone()), inputs)
     }
 
-    /// Creates an Add operation and applies it to the inputs.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    /// use instmodel::layers::Activation;
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let x = ops::dense(4, Activation::Relu, input.buffer());
-    /// let y = ops::dense(4, Activation::Relu, x.clone());
-    /// let sum = ops::add(vec![x, y]);
-    /// assert_eq!(sum.size(), 4);
-    /// ```
-    pub fn add(inputs: Vec<DataBuffer>) -> DataBuffer {
-        assert!(inputs.len() >= 2, "Add requires at least 2 inputs");
-        let size = inputs[0].size();
-        for input in &inputs[1..] {
-            assert_eq!(
-                input.size(),
-                size,
-                "All inputs to Add must have the same size"
-            );
-        }
-        Operation::add().apply_multi(inputs)
-    }
-
-    /// Creates a Multiply operation and applies it to the inputs.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    /// use instmodel::layers::Activation;
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let x = ops::dense(4, Activation::Relu, input.buffer());
-    /// let y = ops::dense(4, Activation::Relu, x.clone());
-    /// let product = ops::multiply(vec![x, y]);
-    /// assert_eq!(product.size(), 4);
-    /// ```
-    pub fn multiply(inputs: Vec<DataBuffer>) -> DataBuffer {
-        assert!(inputs.len() >= 2, "Multiply requires at least 2 inputs");
-        let size = inputs[0].size();
-        for input in &inputs[1..] {
-            assert_eq!(
-                input.size(),
-                size,
-                "All inputs to Multiply must have the same size"
-            );
-        }
-        Operation::multiply().apply_multi(inputs)
-    }
-
-    /// Concatenates buffers along the feature dimension.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    /// use instmodel::layers::Activation;
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let features_a = ops::dense(3, Activation::Relu, input.buffer());
-    /// let features_b = ops::dense(2, Activation::Relu, features_a.clone());
-    /// let combined = ops::concat(vec![features_a, features_b]);
-    /// assert_eq!(combined.size(), 5);
-    /// ```
-    pub fn concat(inputs: Vec<DataBuffer>) -> DataBuffer {
-        assert!(!inputs.is_empty(), "Concat requires at least 1 input");
-        Operation::concat().apply_multi(inputs)
-    }
-
-    /// Applies softmax activation to the input buffer.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    /// use instmodel::layers::Activation;
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let logits = ops::dense(3, Activation::None, input.buffer());
-    /// let probs = ops::softmax(logits);
-    /// assert_eq!(probs.size(), 3);
-    /// ```
-    pub fn softmax(input: DataBuffer) -> DataBuffer {
-        Operation::softmax().apply(input)
-    }
-
-    /// Scales (element-wise multiply) the input by a fixed parameter vector.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    ///
-    /// let input = InputBuffer::new(3);
-    /// let scaled = ops::scale(vec![1.0, 2.0, 3.0], input.buffer());
-    /// assert_eq!(scaled.size(), 3);
-    /// ```
-    pub fn scale(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
-        assert_eq!(
-            vector.len(),
-            input.size(),
-            "Scale vector length must match input size"
-        );
-        Operation::scale(vector).apply(input)
-    }
-
-    /// Shifts (element-wise add) the input by a fixed parameter vector.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    ///
-    /// let input = InputBuffer::new(3);
-    /// let shifted = ops::shift(vec![0.1, 0.2, 0.3], input.buffer());
-    /// assert_eq!(shifted.size(), 3);
-    /// ```
-    pub fn shift(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
-        assert_eq!(
-            vector.len(),
-            input.size(),
-            "Shift vector length must match input size"
-        );
-        Operation::shift(vector).apply(input)
-    }
-
-    /// Scales (element-wise multiply) the input by a fixed parameter vector, in-place.
-    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
-    pub fn scale_inplace(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
-        assert_eq!(
-            vector.len(),
-            input.size(),
-            "Scale vector length must match input size"
-        );
-        Operation::scale_with_inplace(vector, true).apply(input)
-    }
-
-    /// Shifts (element-wise add) the input by a fixed parameter vector, in-place.
-    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
-    pub fn shift_inplace(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
-        assert_eq!(
-            vector.len(),
-            input.size(),
-            "Shift vector length must match input size"
-        );
-        Operation::shift_with_inplace(vector, true).apply(input)
-    }
-
-    /// Applies batch normalization to the input (with center and scale enabled).
-    ///
-    /// During training, tracks running mean/variance. At export, converts to
-    /// element-wise ADD and MUL operations for efficient inference.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let normalized = ops::batch_norm(input.buffer());
-    /// assert_eq!(normalized.size(), 4);
-    /// ```
-    pub fn batch_norm(input: DataBuffer) -> DataBuffer {
-        Operation::batch_norm_default().apply(input)
-    }
-
-    /// Applies batch normalization with custom epsilon (with center and scale enabled).
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let normalized = ops::batch_norm_with_epsilon(1e-5, input.buffer());
-    /// assert_eq!(normalized.size(), 4);
-    /// ```
-    pub fn batch_norm_with_epsilon(epsilon: f32, input: DataBuffer) -> DataBuffer {
-        Operation::batch_norm(epsilon, true, true).apply(input)
-    }
-
-    /// Applies batch normalization with scale only (no learnable beta/center).
-    ///
-    /// Learns gamma (scale) per feature but sets beta=0.
-    /// Formula: output = gamma * (x - mean) / sqrt(var + eps)
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let normalized = ops::batch_norm_scale_only(input.buffer());
-    /// assert_eq!(normalized.size(), 4);
-    /// ```
-    pub fn batch_norm_scale_only(input: DataBuffer) -> DataBuffer {
-        Operation::batch_norm_scale_only(1e-3).apply(input)
-    }
-
-    /// Applies batch normalization with full configuration.
-    ///
-    /// # Arguments
-    /// * `epsilon` - Numerical stability constant
-    /// * `center` - If true, learn beta (bias); if false, beta=0
-    /// * `scale` - If true, learn gamma; if false, gamma=1
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    ///
-    /// let input = InputBuffer::new(4);
-    /// // Scale only, no center
-    /// let normalized = ops::batch_norm_config(1e-5, false, true, input.buffer());
-    /// assert_eq!(normalized.size(), 4);
-    /// ```
-    pub fn batch_norm_config(
-        epsilon: f32,
-        center: bool,
-        scale: bool,
-        input: DataBuffer,
-    ) -> DataBuffer {
-        Operation::batch_norm(epsilon, center, scale).apply(input)
-    }
-
-    /// Applies batch normalization in-place (with center and scale enabled).
-    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
-    pub fn batch_norm_inplace(input: DataBuffer) -> DataBuffer {
-        Operation::batch_norm_with_inplace(1e-3, true, true, true).apply(input)
-    }
-
-    /// Applies batch normalization with full configuration, in-place.
-    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
-    pub fn batch_norm_config_inplace(
-        epsilon: f32,
-        center: bool,
-        scale: bool,
-        input: DataBuffer,
-    ) -> DataBuffer {
-        Operation::batch_norm_with_inplace(epsilon, center, scale, true).apply(input)
-    }
-
-    /// Applies a standalone activation function (no learnable weights).
-    /// Default: in_place=false (creates new buffer with COPY, preserving original)
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    /// use instmodel::layers::Activation;
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let logits = ops::dense(3, Activation::None, input.buffer());
-    /// let probs = ops::activation(Activation::Sigmoid, logits);
-    /// assert_eq!(probs.size(), 3);
-    /// ```
-    pub fn activation(act: Activation, input: DataBuffer) -> DataBuffer {
-        Operation::standalone_activation(act).apply(input)
-    }
-
-    /// Applies a standalone activation function in-place (no COPY).
-    /// WARNING: in_place=true destroys the input buffer - only use if you won't need it again.
-    ///
-    /// # Example
-    /// ```
-    /// use instmodel::graph::{InputBuffer, ops};
-    /// use instmodel::layers::Activation;
-    ///
-    /// let input = InputBuffer::new(4);
-    /// let logits = ops::dense(3, Activation::None, input.buffer());
-    /// let probs = ops::activation_inplace(Activation::Sigmoid, logits);
-    /// assert_eq!(probs.size(), 3);
-    /// ```
-    pub fn activation_inplace(act: Activation, input: DataBuffer) -> DataBuffer {
-        Operation::standalone_activation_with_inplace(act, true).apply(input)
-    }
-}
-
-impl Operation {
-    /// Compiles this operation to instruction format.
+    /// Emits instructions for this op and returns its output buffer index.
+    /// Dense gets a placeholder weight slot; BatchNorm must use [`Self::compile_batch_norm`].
     pub fn compile(&self, input_indices: &[usize], ctx: &mut CompileContext) -> usize {
+        let input = input_indices[0];
         match self {
             Self::Dense {
                 id,
                 output_size,
                 activation,
             } => {
-                let weight_index = ctx.get_or_create_weight_index(*id);
-                let output_index = ctx.allocate_buffer(*output_size);
-
-                let instruction = InstructionExport::Dot {
-                    input: input_indices[0],
-                    output: output_index,
-                    weights: weight_index,
+                let weights = ctx.get_or_create_weight_index(*id);
+                let output = ctx.allocate_buffer(*output_size);
+                ctx.add_instruction(InstructionExport::Dot {
+                    input,
+                    output,
+                    weights,
                     activation: activation.to_instruction_name().map(String::from),
-                };
-                ctx.add_instruction(instruction);
-
-                output_index
+                });
+                output
             }
-            Self::Add { .. } => {
-                let output_size = ctx.buffer_sizes[input_indices[0]];
-                let output_index = ctx.allocate_buffer(output_size);
-
-                let instruction = InstructionExport::AddBuffers {
-                    input: input_indices.to_vec(),
-                    output: output_index,
-                };
-                ctx.add_instruction(instruction);
-
-                output_index
-            }
-            Self::Multiply { .. } => {
-                let output_size = ctx.buffer_sizes[input_indices[0]];
-                let output_index = ctx.allocate_buffer(output_size);
-
-                let instruction = InstructionExport::MultiplyBuffers {
-                    input: input_indices.to_vec(),
-                    output: output_index,
-                };
-                ctx.add_instruction(instruction);
-
-                output_index
+            Self::Add { .. } | Self::Multiply { .. } => {
+                let output = ctx.allocate_buffer(ctx.buffer_sizes[input]);
+                let input = input_indices.to_vec();
+                ctx.add_instruction(if matches!(self, Self::Add { .. }) {
+                    InstructionExport::AddBuffers { input, output }
+                } else {
+                    InstructionExport::MultiplyBuffers { input, output }
+                });
+                output
             }
             Self::Concat { .. } => {
-                let total_size: usize = input_indices.iter().map(|&i| ctx.buffer_sizes[i]).sum();
-                let output_index = ctx.allocate_buffer(total_size);
-
+                let total = input_indices.iter().map(|&i| ctx.buffer_sizes[i]).sum();
+                let output = ctx.allocate_buffer(total);
                 let mut offset = 0;
-                for &input_idx in input_indices {
-                    let input_size = ctx.buffer_sizes[input_idx];
-
-                    // Use COPY with internal_index (like Python Concatenate)
-                    // This copies the entire input buffer to output at offset
-                    let instruction = InstructionExport::Copy {
-                        input: input_idx,
-                        output: output_index,
+                for &input in input_indices {
+                    ctx.add_instruction(InstructionExport::Copy {
+                        input,
+                        output,
                         internal_index: offset,
-                    };
-                    ctx.add_instruction(instruction);
-
-                    offset += input_size;
+                    });
+                    offset += ctx.buffer_sizes[input];
                 }
-
-                output_index
+                output
             }
             Self::Softmax { .. } => {
-                let output_size = ctx.buffer_sizes[input_indices[0]];
-                let output_index = ctx.allocate_buffer(output_size);
-
-                // First copy input to output
-                let copy_instruction = InstructionExport::Copy {
-                    input: input_indices[0],
-                    output: output_index,
-                    internal_index: 0,
-                };
-                ctx.add_instruction(copy_instruction);
-
-                // Then apply softmax activation
-                let activation_instruction = InstructionExport::Activation {
-                    input: output_index,
+                let target = copy_target(ctx, input, ctx.buffer_sizes[input], false);
+                ctx.add_instruction(InstructionExport::Activation {
+                    input: target,
                     activation: "SOFTMAX".to_string(),
-                };
-                ctx.add_instruction(activation_instruction);
-
-                output_index
+                });
+                target
             }
             Self::Scale {
                 id,
                 vector,
                 in_place,
-            } => {
-                let target_index = if *in_place {
-                    // in_place=true: operate directly on input buffer (no COPY, no new buffer)
-                    input_indices[0]
-                } else {
-                    // in_place=false: allocate new buffer and copy input
-                    let output_size = vector.len();
-                    let output_index = ctx.allocate_buffer(output_size);
-                    let copy_instruction = InstructionExport::Copy {
-                        input: input_indices[0],
-                        output: output_index,
-                        internal_index: 0,
-                    };
-                    ctx.add_instruction(copy_instruction);
-                    output_index
-                };
-
-                // Store parameters and add MUL_ELEMENTWISE instruction
-                let param_index = ctx.get_or_store_parameters(*id, vector);
-                let mul_instruction = InstructionExport::MulElementwise {
-                    input: target_index,
-                    parameters: param_index,
-                };
-                ctx.add_instruction(mul_instruction);
-
-                target_index
             }
-            Self::Shift {
+            | Self::Shift {
                 id,
                 vector,
                 in_place,
             } => {
-                let target_index = if *in_place {
-                    // in_place=true: operate directly on input buffer (no COPY, no new buffer)
-                    input_indices[0]
+                let target = copy_target(ctx, input, vector.len(), *in_place);
+                let parameters = ctx.get_or_store_parameters(*id, vector);
+                ctx.add_instruction(if matches!(self, Self::Scale { .. }) {
+                    InstructionExport::MulElementwise {
+                        input: target,
+                        parameters,
+                    }
                 } else {
-                    // in_place=false: allocate new buffer and copy input
-                    let output_size = vector.len();
-                    let output_index = ctx.allocate_buffer(output_size);
-                    let copy_instruction = InstructionExport::Copy {
-                        input: input_indices[0],
-                        output: output_index,
-                        internal_index: 0,
-                    };
-                    ctx.add_instruction(copy_instruction);
-                    output_index
-                };
-
-                // Store parameters and add ADD_ELEMENTWISE instruction
-                let param_index = ctx.get_or_store_parameters(*id, vector);
-                let add_instruction = InstructionExport::AddElementwise {
-                    input: target_index,
-                    parameters: param_index,
-                };
-                ctx.add_instruction(add_instruction);
-
-                target_index
+                    InstructionExport::AddElementwise {
+                        input: target,
+                        parameters,
+                    }
+                });
+                target
             }
             Self::BatchNorm { .. } => {
                 panic!(
@@ -679,42 +273,21 @@ impl Operation {
                 in_place,
                 ..
             } => {
-                let target_index = if *in_place {
-                    // in_place=true: operate directly on input buffer (no COPY, no new buffer)
-                    input_indices[0]
-                } else {
-                    // in_place=false: allocate new buffer and copy input
-                    let output_size = ctx.buffer_sizes[input_indices[0]];
-                    let output_index = ctx.allocate_buffer(output_size);
-                    let copy_instruction = InstructionExport::Copy {
-                        input: input_indices[0],
-                        output: output_index,
-                        internal_index: 0,
-                    };
-                    ctx.add_instruction(copy_instruction);
-                    output_index
-                };
-
-                // Apply activation to target buffer
-                let activation_instruction = InstructionExport::Activation {
-                    input: target_index,
+                let target = copy_target(ctx, input, ctx.buffer_sizes[input], *in_place);
+                ctx.add_instruction(InstructionExport::Activation {
+                    input: target,
                     activation: activation
                         .to_instruction_name()
                         .unwrap_or("NONE")
                         .to_string(),
-                };
-                ctx.add_instruction(activation_instruction);
-
-                target_index
+                });
+                target
             }
         }
     }
 
-    /// Compiles BatchNorm operation with trained parameters.
-    /// Parameters: (center, std, beta) where:
-    /// - center = -running_mean
-    /// - std = gamma / sqrt(running_variance + epsilon)
-    /// - beta = learned bias
+    /// Emits BatchNorm as ADD(center) → MUL(std) → ADD(beta), where center = -running_mean,
+    /// std = gamma / sqrt(running_var + eps) and beta is the learned shift.
     pub fn compile_batch_norm(
         &self,
         input_indices: &[usize],
@@ -726,48 +299,162 @@ impl Operation {
         let Self::BatchNorm { id, in_place, .. } = self else {
             panic!("compile_batch_norm called on non-BatchNorm operation");
         };
+        let input = input_indices[0];
+        let target = copy_target(ctx, input, ctx.buffer_sizes[input], *in_place);
 
-        let target_index = if *in_place {
-            // in_place=true: operate directly on input buffer (no COPY, no new buffer)
-            input_indices[0]
-        } else {
-            // in_place=false: allocate new buffer and copy input
-            let output_size = ctx.buffer_sizes[input_indices[0]];
-            let output_index = ctx.allocate_buffer(output_size);
-            let copy_instruction = InstructionExport::Copy {
-                input: input_indices[0],
-                output: output_index,
-                internal_index: 0,
-            };
-            ctx.add_instruction(copy_instruction);
-            output_index
+        // The three vectors are stored contiguously under this op's id, so a shared BatchNorm
+        // reuses them and they can never collide with another op's parameters.
+        let first = match ctx.visited_param_ops.get(id) {
+            Some(&idx) => idx,
+            None => {
+                let idx = ctx.parameters.len();
+                ctx.parameters
+                    .extend([center.to_vec(), std.to_vec(), beta.to_vec()]);
+                ctx.visited_param_ops.insert(*id, idx);
+                idx
+            }
         };
+        for (offset, mul) in [(0, false), (1, true), (2, false)] {
+            let parameters = first + offset;
+            ctx.add_instruction(if mul {
+                InstructionExport::MulElementwise {
+                    input: target,
+                    parameters,
+                }
+            } else {
+                InstructionExport::AddElementwise {
+                    input: target,
+                    parameters,
+                }
+            });
+        }
+        target
+    }
+}
 
-        // 1. ADD_ELEMENTWISE: x + center (i.e., x - mean)
-        let center_param_index = ctx.get_or_store_parameters(*id, center);
-        let center_instruction = InstructionExport::AddElementwise {
-            input: target_index,
-            parameters: center_param_index,
-        };
-        ctx.add_instruction(center_instruction);
+/// Returns the buffer an elementwise op writes to: the input itself, or a fresh COPY of it.
+fn copy_target(ctx: &mut CompileContext, input: usize, size: usize, in_place: bool) -> usize {
+    if in_place {
+        return input;
+    }
+    let output = ctx.allocate_buffer(size);
+    ctx.add_instruction(InstructionExport::Copy {
+        input,
+        output,
+        internal_index: 0,
+    });
+    output
+}
 
-        // 2. MUL_ELEMENTWISE: x * std (i.e., x * gamma / sqrt(var + eps))
-        let std_param_index = ctx.get_or_store_parameters(*id + 1_000_000, std);
-        let mul_instruction = InstructionExport::MulElementwise {
-            input: target_index,
-            parameters: std_param_index,
-        };
-        ctx.add_instruction(mul_instruction);
+/// One-step create-and-apply helpers mirroring the Python API.
+pub mod ops {
+    use super::*;
 
-        // 3. ADD_ELEMENTWISE: x + beta
-        let beta_param_index = ctx.get_or_store_parameters(*id + 2_000_000, beta);
-        let beta_instruction = InstructionExport::AddElementwise {
-            input: target_index,
-            parameters: beta_param_index,
-        };
-        ctx.add_instruction(beta_instruction);
+    fn assert_same_sizes(name: &str, inputs: &[DataBuffer]) {
+        assert!(inputs.len() >= 2, "{name} requires at least 2 inputs");
+        assert!(
+            inputs.iter().all(|b| b.size() == inputs[0].size()),
+            "All inputs to {name} must have the same size"
+        );
+    }
 
-        target_index
+    fn assert_vector_len(name: &str, vector: &[f32], input: &DataBuffer) {
+        assert_eq!(
+            vector.len(),
+            input.size(),
+            "{name} vector length must match input size"
+        );
+    }
+
+    pub fn dense(output_size: usize, activation: Activation, input: DataBuffer) -> DataBuffer {
+        Operation::dense(output_size, activation).apply(input)
+    }
+
+    pub fn add(inputs: Vec<DataBuffer>) -> DataBuffer {
+        assert_same_sizes("Add", &inputs);
+        Operation::add().apply_multi(inputs)
+    }
+
+    pub fn multiply(inputs: Vec<DataBuffer>) -> DataBuffer {
+        assert_same_sizes("Multiply", &inputs);
+        Operation::multiply().apply_multi(inputs)
+    }
+
+    pub fn concat(inputs: Vec<DataBuffer>) -> DataBuffer {
+        assert!(!inputs.is_empty(), "Concat requires at least 1 input");
+        Operation::concat().apply_multi(inputs)
+    }
+
+    pub fn softmax(input: DataBuffer) -> DataBuffer {
+        Operation::softmax().apply(input)
+    }
+
+    pub fn scale(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
+        assert_vector_len("Scale", &vector, &input);
+        Operation::scale(vector).apply(input)
+    }
+
+    pub fn shift(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
+        assert_vector_len("Shift", &vector, &input);
+        Operation::shift(vector).apply(input)
+    }
+
+    /// Overwrites the input buffer at inference; don't reuse the input afterwards.
+    pub fn scale_inplace(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
+        assert_vector_len("Scale", &vector, &input);
+        Operation::scale_with_inplace(vector, true).apply(input)
+    }
+
+    /// Overwrites the input buffer at inference; don't reuse the input afterwards.
+    pub fn shift_inplace(vector: Vec<f32>, input: DataBuffer) -> DataBuffer {
+        assert_vector_len("Shift", &vector, &input);
+        Operation::shift_with_inplace(vector, true).apply(input)
+    }
+
+    /// Exported as element-wise ADD/MUL/ADD using the running statistics.
+    pub fn batch_norm(input: DataBuffer) -> DataBuffer {
+        Operation::batch_norm_default().apply(input)
+    }
+
+    pub fn batch_norm_with_epsilon(epsilon: f32, input: DataBuffer) -> DataBuffer {
+        Operation::batch_norm(epsilon, true, true).apply(input)
+    }
+
+    pub fn batch_norm_scale_only(input: DataBuffer) -> DataBuffer {
+        Operation::batch_norm_scale_only(1e-3).apply(input)
+    }
+
+    pub fn batch_norm_config(
+        epsilon: f32,
+        center: bool,
+        scale: bool,
+        input: DataBuffer,
+    ) -> DataBuffer {
+        Operation::batch_norm(epsilon, center, scale).apply(input)
+    }
+
+    /// Overwrites the input buffer at inference; don't reuse the input afterwards.
+    pub fn batch_norm_inplace(input: DataBuffer) -> DataBuffer {
+        Operation::batch_norm_with_inplace(1e-3, true, true, true).apply(input)
+    }
+
+    /// Overwrites the input buffer at inference; don't reuse the input afterwards.
+    pub fn batch_norm_config_inplace(
+        epsilon: f32,
+        center: bool,
+        scale: bool,
+        input: DataBuffer,
+    ) -> DataBuffer {
+        Operation::batch_norm_with_inplace(epsilon, center, scale, true).apply(input)
+    }
+
+    pub fn activation(act: Activation, input: DataBuffer) -> DataBuffer {
+        Operation::standalone_activation(act).apply(input)
+    }
+
+    /// Overwrites the input buffer at inference; don't reuse the input afterwards.
+    pub fn activation_inplace(act: Activation, input: DataBuffer) -> DataBuffer {
+        Operation::standalone_activation_with_inplace(act, true).apply(input)
     }
 }
 
@@ -777,177 +464,69 @@ mod tests {
     use crate::graph::buffer::InputBuffer;
 
     #[test]
-    fn test_dense_creation() {
-        let dense = Operation::dense(8, Activation::Relu);
-        assert!(matches!(dense, Operation::Dense { output_size: 8, .. }));
-    }
-
-    #[test]
-    fn test_add_creation() {
-        let add = Operation::add();
-        assert!(matches!(add, Operation::Add { .. }));
-    }
-
-    #[test]
-    fn test_multiply_creation() {
-        let mul = Operation::multiply();
-        assert!(matches!(mul, Operation::Multiply { .. }));
-    }
-
-    #[test]
-    fn test_unique_ids() {
-        let op1 = Operation::dense(4, Activation::None);
-        let op2 = Operation::add();
-        let op3 = Operation::multiply();
-
-        assert_ne!(op1.id(), op2.id());
-        assert_ne!(op2.id(), op3.id());
-    }
-
-    #[test]
-    fn test_output_size() {
-        let dense = Operation::dense(8, Activation::Relu);
-        assert_eq!(dense.output_size(&[4]), 8);
-
-        let add = Operation::add();
-        assert_eq!(add.output_size(&[4, 4]), 4);
-    }
-
-    #[test]
-    fn test_convenience_dense() {
-        let input = InputBuffer::new(4);
-        let output = ops::dense(8, Activation::Relu, input.buffer());
-        assert_eq!(output.size(), 8);
-        assert!(output.producer().is_some());
-    }
-
-    #[test]
-    fn test_convenience_add() {
-        let input1 = InputBuffer::new(4);
-        let input2 = InputBuffer::new(4);
-        let output = ops::add(vec![input1.buffer(), input2.buffer()]);
-        assert_eq!(output.size(), 4);
-    }
-
-    #[test]
-    fn test_convenience_multiply() {
-        let input1 = InputBuffer::new(4);
-        let input2 = InputBuffer::new(4);
-        let output = ops::multiply(vec![input1.buffer(), input2.buffer()]);
-        assert_eq!(output.size(), 4);
+    fn output_sizes() {
+        let input = || InputBuffer::new(4).buffer();
+        assert_eq!(ops::dense(8, Activation::Relu, input()).size(), 8);
+        assert_eq!(ops::add(vec![input(), input()]).size(), 4);
+        assert_eq!(ops::multiply(vec![input(), input()]).size(), 4);
+        assert_eq!(
+            ops::concat(vec![input(), InputBuffer::new(3).buffer()]).size(),
+            7
+        );
+        assert_eq!(ops::softmax(input()).size(), 4);
+        assert_eq!(ops::scale(vec![1.0; 4], input()).size(), 4);
+        assert_eq!(ops::shift_inplace(vec![1.0; 4], input()).size(), 4);
+        assert_eq!(ops::batch_norm(input()).size(), 4);
+        assert_eq!(ops::activation(Activation::Gelu, input()).size(), 4);
+        assert_ne!(Operation::add().id(), Operation::add().id());
     }
 
     #[test]
     #[should_panic(expected = "Add requires at least 2 inputs")]
-    fn test_add_requires_two_inputs() {
-        let input = InputBuffer::new(4);
-        ops::add(vec![input.buffer()]);
+    fn add_requires_two_inputs() {
+        ops::add(vec![InputBuffer::new(4).buffer()]);
     }
 
     #[test]
-    #[should_panic(expected = "All inputs to Add must have the same size")]
-    fn test_add_requires_same_size() {
-        let input1 = InputBuffer::new(4);
-        let input2 = InputBuffer::new(5);
-        ops::add(vec![input1.buffer(), input2.buffer()]);
-    }
-
-    #[test]
-    fn test_concat_creation() {
-        let concat = Operation::concat();
-        assert!(matches!(concat, Operation::Concat { .. }));
-    }
-
-    #[test]
-    fn test_softmax_creation() {
-        let softmax = Operation::softmax();
-        assert!(matches!(softmax, Operation::Softmax { .. }));
-    }
-
-    #[test]
-    fn test_convenience_concat() {
-        let input1 = InputBuffer::new(4);
-        let input2 = InputBuffer::new(3);
-        let output = ops::concat(vec![input1.buffer(), input2.buffer()]);
-        assert_eq!(output.size(), 7);
-    }
-
-    #[test]
-    fn test_convenience_softmax() {
-        let input = InputBuffer::new(4);
-        let output = ops::softmax(input.buffer());
-        assert_eq!(output.size(), 4);
-    }
-
-    #[test]
-    fn test_concat_output_size() {
-        let concat = Operation::concat();
-        assert_eq!(concat.output_size(&[4, 3, 2]), 9);
-    }
-
-    #[test]
-    fn test_softmax_output_size() {
-        let softmax = Operation::softmax();
-        assert_eq!(softmax.output_size(&[10]), 10);
+    #[should_panic(expected = "All inputs to Multiply must have the same size")]
+    fn multiply_requires_same_size() {
+        ops::multiply(vec![
+            InputBuffer::new(4).buffer(),
+            InputBuffer::new(5).buffer(),
+        ]);
     }
 
     #[test]
     #[should_panic(expected = "Concat requires at least 1 input")]
-    fn test_concat_requires_input() {
+    fn concat_requires_input() {
         ops::concat(vec![]);
     }
 
     #[test]
-    fn test_scale_creation() {
-        let scale = Operation::scale(vec![1.0, 2.0, 3.0]);
-        assert!(matches!(scale, Operation::Scale { vector, .. } if vector.len() == 3));
-    }
-
-    #[test]
-    fn test_shift_creation() {
-        let shift = Operation::shift(vec![0.1, 0.2, 0.3]);
-        assert!(matches!(shift, Operation::Shift { vector, .. } if vector.len() == 3));
-    }
-
-    #[test]
-    fn test_scale_output_size() {
-        let scale = Operation::scale(vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(scale.output_size(&[4]), 4);
-    }
-
-    #[test]
-    fn test_shift_output_size() {
-        let shift = Operation::shift(vec![0.1, 0.2, 0.3]);
-        assert_eq!(shift.output_size(&[3]), 3);
-    }
-
-    #[test]
-    fn test_convenience_scale() {
-        let input = InputBuffer::new(3);
-        let output = ops::scale(vec![1.0, 2.0, 3.0], input.buffer());
-        assert_eq!(output.size(), 3);
-        assert!(output.producer().is_some());
-    }
-
-    #[test]
-    fn test_convenience_shift() {
-        let input = InputBuffer::new(3);
-        let output = ops::shift(vec![0.1, 0.2, 0.3], input.buffer());
-        assert_eq!(output.size(), 3);
-        assert!(output.producer().is_some());
-    }
-
-    #[test]
-    #[should_panic(expected = "Scale vector length must match input size")]
-    fn test_scale_requires_matching_size() {
-        let input = InputBuffer::new(4);
-        ops::scale(vec![1.0, 2.0, 3.0], input.buffer());
-    }
-
-    #[test]
     #[should_panic(expected = "Shift vector length must match input size")]
-    fn test_shift_requires_matching_size() {
-        let input = InputBuffer::new(4);
-        ops::shift(vec![0.1, 0.2], input.buffer());
+    fn shift_requires_matching_size() {
+        ops::shift(vec![0.1, 0.2], InputBuffer::new(4).buffer());
+    }
+
+    #[test]
+    fn batch_norm_params_do_not_collide_with_other_ops() {
+        let bn = Operation::batch_norm_default();
+        let mut ctx = CompileContext::new();
+        ctx.register_input(0, 2, None);
+        // Previously BatchNorm keyed its std/beta vectors on id + 1_000_000 / 2_000_000.
+        ctx.get_or_store_parameters(bn.id() + 1_000_000, &[9.0, 9.0]);
+        bn.compile_batch_norm(&[0], &mut ctx, &[1.0; 2], &[2.0; 2], &[3.0; 2]);
+        bn.compile_batch_norm(&[0], &mut ctx, &[7.0; 2], &[7.0; 2], &[7.0; 2]);
+        assert_eq!(
+            ctx.parameters,
+            vec![vec![9.0; 2], vec![1.0; 2], vec![2.0; 2], vec![3.0; 2]]
+        );
+        let used: Vec<_> = ctx
+            .instructions
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap()["parameters"].as_u64())
+            .collect();
+        let expected = [None, Some(1), Some(2), Some(3)];
+        assert_eq!(used, [expected, expected].concat());
     }
 }

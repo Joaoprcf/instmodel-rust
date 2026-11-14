@@ -1,27 +1,17 @@
-//! Functional graph API for building neural networks.
-//!
-//! This module provides a functional API for building computation graphs.
-//!
-//! # Example
+//! Functional graph API: build a weight-free graph, then `compile` it on a device.
 //!
 //! ```
 //! use instmodel::graph::{InputBuffer, ModelGraph, ops};
 //! use instmodel::layers::Activation;
 //! use burn::backend::NdArray;
-//! use burn::tensor::backend::Backend;
 //!
-//! type TestBackend = NdArray;
-//! let device = <TestBackend as Backend>::Device::default();
-//!
-//! // Create input and build graph (no device needed)
 //! let input = InputBuffer::new(4);
-//! let x = input.buffer();
-//! let hidden = ops::dense(8, Activation::Relu, x.clone());
+//! let hidden = ops::dense(8, Activation::Relu, input.buffer());
 //! let output = ops::dense(1, Activation::Sigmoid, hidden);
-//! let graph = ModelGraph::new(vec![input], output);
-//!
-//! // Compile to create weights on device
-//! let model = graph.compile::<TestBackend>(&device).unwrap();
+//! let model = ModelGraph::new(vec![input], output)
+//!     .compile::<NdArray>(&Default::default())
+//!     .unwrap();
+//! assert!(model.export_to_instruction_model().unwrap().contains("DOT"));
 //! ```
 
 mod buffer;

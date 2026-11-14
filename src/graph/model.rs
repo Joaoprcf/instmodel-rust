@@ -1,77 +1,18 @@
-//! CompiledModel - the compiled neural network with initialized weights.
-
 use std::collections::HashMap;
 
 use burn::module::{Ignored, Module};
-use burn::nn::{BatchNorm, BatchNormConfig, Linear, LinearConfig};
+use burn::nn::{BatchNorm, BatchNormConfig};
 use burn::tensor::{Tensor, backend::Backend};
 
 use crate::errors::ModelError;
-use crate::layers::Activation;
+use crate::layers::{Activation, Dense, DenseConfig};
 
 use super::buffer::{BufferId, DataBuffer, InputBuffer, Producer};
 use super::compile::{CompileContext, InstructionModelExport};
-use super::core::GraphId;
+use super::core::{GraphId, ModelGraph};
 use super::operation::{OpId, Operation};
 
-/// Initialized Dense layer with Burn's Linear module.
-#[derive(Module, Debug)]
-struct DenseLayer<B: Backend> {
-    linear: Linear<B>,
-    output_size: usize,
-    input_size: usize,
-    activation_id: u8,
-}
-
-impl<B: Backend> DenseLayer<B> {
-    fn new(
-        input_size: usize,
-        output_size: usize,
-        activation: Activation,
-        device: &B::Device,
-    ) -> Self {
-        let linear = LinearConfig::new(input_size, output_size).init(device);
-        Self {
-            linear,
-            output_size,
-            input_size,
-            activation_id: activation.to_id(),
-        }
-    }
-
-    fn activation(&self) -> Activation {
-        Activation::from_id(self.activation_id)
-    }
-
-    fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let output = self.linear.forward(input);
-        self.activation().apply(output)
-    }
-
-    fn weights_to_vec(&self) -> Vec<Vec<f32>> {
-        let weight_tensor = self.linear.weight.val();
-        let weights_data = weight_tensor.to_data();
-        let flat: Vec<f32> = weights_data.to_vec().unwrap();
-
-        let mut result = vec![vec![0.0f32; self.input_size]; self.output_size];
-        for i in 0..self.output_size {
-            for j in 0..self.input_size {
-                result[i][j] = flat[i + j * self.output_size];
-            }
-        }
-        result
-    }
-
-    fn bias_to_vec(&self) -> Vec<f32> {
-        match &self.linear.bias {
-            Some(bias) => bias.val().to_data().to_vec().unwrap(),
-            None => vec![0.0; self.output_size],
-        }
-    }
-}
-
-/// Initialized BatchNorm layer with Burn's BatchNorm module.
-/// Supports optional center (beta) and scale (gamma) parameters.
+/// BatchNorm that always normalises with the running statistics, matching the exported model.
 #[derive(Module, Debug)]
 struct BatchNormLayer<B: Backend> {
     batch_norm: BatchNorm<B>,
@@ -91,11 +32,10 @@ impl<B: Backend> BatchNormLayer<B> {
         scale: bool,
         device: &B::Device,
     ) -> Self {
-        let batch_norm = BatchNormConfig::new(num_features)
-            .with_epsilon(epsilon as f64)
-            .init(device);
         Self {
-            batch_norm,
+            batch_norm: BatchNormConfig::new(num_features)
+                .with_epsilon(epsilon as f64)
+                .init(device),
             num_features,
             epsilon,
             center: Ignored(center),
@@ -104,170 +44,156 @@ impl<B: Backend> BatchNormLayer<B> {
     }
 
     fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let [_batch, features] = input.dims();
-        let device = input.device();
-
-        // Get running stats
-        let running_mean = self.batch_norm.running_mean.value();
-        let running_var = self.batch_norm.running_var.value();
-
-        // Normalize: (x - mean) / sqrt(var + eps)
-        let mean_2d = running_mean.clone().reshape([1, features]);
-        let var_2d = running_var.clone().reshape([1, features]);
-        let eps = Tensor::<B, 2>::full([1, features], self.epsilon as f64, &device);
-        let std = (var_2d + eps).sqrt();
-
-        let normalized = (input - mean_2d) / std;
-
-        // Apply gamma (scale) if enabled
-        let scaled = if self.scale.0 {
-            let gamma = self.batch_norm.gamma.val();
-            let gamma_2d = gamma.reshape([1, features]);
-            normalized * gamma_2d
-        } else {
-            normalized
-        };
-
-        // Apply beta (center/shift) if enabled
-        if self.center.0 {
-            let beta = self.batch_norm.beta.val();
-            let beta_2d = beta.reshape([1, features]);
-            scaled + beta_2d
-        } else {
-            scaled
+        let [_, features] = input.dims();
+        let bn = &self.batch_norm;
+        let mean = bn.running_mean.value().reshape([1, features]);
+        let std = (bn.running_var.value().reshape([1, features]) + self.epsilon).sqrt();
+        let mut x = (input - mean) / std;
+        if self.scale.0 {
+            x = x * bn.gamma.val().reshape([1, features]);
         }
+        if self.center.0 {
+            x = x + bn.beta.val().reshape([1, features]);
+        }
+        x
     }
 
-    fn get_normalization_params(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let gamma: Vec<f32> = self.batch_norm.gamma.val().to_data().to_vec().unwrap();
-        let beta: Vec<f32> = self.batch_norm.beta.val().to_data().to_vec().unwrap();
-        let running_mean: Vec<f32> = self
-            .batch_norm
-            .running_mean
-            .value()
-            .to_data()
-            .to_vec()
-            .unwrap();
-        let running_var: Vec<f32> = self
-            .batch_norm
-            .running_var
-            .value()
-            .to_data()
-            .to_vec()
-            .unwrap();
-
-        let epsilon = self.epsilon;
-
-        // center = -moving_mean
-        let center: Vec<f32> = running_mean.iter().map(|m| -m).collect();
-
-        // std = gamma / sqrt(variance + epsilon) if scale enabled, else 1/sqrt(var+eps)
-        let std: Vec<f32> = if self.scale.0 {
-            gamma
-                .iter()
-                .zip(running_var.iter())
-                .map(|(g, v)| g / (v + epsilon).sqrt())
+    /// Returns `(center, std, beta)` as consumed by [`Operation::compile_batch_norm`].
+    fn normalization_params(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let to_vec = |t: Tensor<B, 1>| -> Vec<f32> { t.to_data().to_vec().unwrap() };
+        let bn = &self.batch_norm;
+        let center = to_vec(bn.running_mean.value()).iter().map(|m| -m).collect();
+        let inv_std = to_vec(bn.running_var.value())
+            .into_iter()
+            .map(|v| 1.0 / (v + self.epsilon).sqrt());
+        let std = if self.scale.0 {
+            to_vec(bn.gamma.val())
+                .into_iter()
+                .zip(inv_std)
+                .map(|(g, s)| g * s)
                 .collect()
         } else {
-            running_var
-                .iter()
-                .map(|v| 1.0 / (v + epsilon).sqrt())
-                .collect()
+            inv_std.collect()
         };
-
-        // beta = learned beta if center enabled, else zeros
-        let beta_out: Vec<f32> = if self.center.0 {
-            beta
+        let beta = if self.center.0 {
+            to_vec(bn.beta.val())
         } else {
             vec![0.0; self.num_features]
         };
-
-        (center, std, beta_out)
+        (center, std, beta)
     }
 }
 
-/// Execution step in the forward pass.
-/// Uses layer indices instead of OpIds for efficient forward pass.
 #[derive(Debug, Clone)]
-enum Step {
-    Dense {
-        layer_index: usize,
-        input: BufferId,
-        output: BufferId,
-    },
-    Add {
-        inputs: Vec<BufferId>,
-        output: BufferId,
-    },
-    Multiply {
-        inputs: Vec<BufferId>,
-        output: BufferId,
-    },
-    Concat {
-        inputs: Vec<BufferId>,
-        output: BufferId,
-    },
-    Softmax {
-        input: BufferId,
-        output: BufferId,
-    },
-    Scale {
-        input: BufferId,
-        output: BufferId,
-        vector: Vec<f32>,
-    },
-    Shift {
-        input: BufferId,
-        output: BufferId,
-        vector: Vec<f32>,
-    },
-    BatchNorm {
-        layer_index: usize,
-        input: BufferId,
-        output: BufferId,
-    },
-    StandaloneActivation {
-        input: BufferId,
-        output: BufferId,
-        activation: Activation,
-    },
+enum StepKind {
+    Dense(usize),
+    BatchNorm(usize),
+    Add,
+    Multiply,
+    Concat,
+    Scale(Vec<f32>),
+    Shift(Vec<f32>),
+    Activation(Activation),
 }
 
-/// Metadata for export: maps layer indices back to OpIds for weight export.
-#[derive(Debug, Clone, Default)]
-struct ExportMetadata {
-    /// Maps dense layer index to OpId for export
-    dense_op_ids: Vec<OpId>,
-    /// Maps batch norm layer index to OpId for export
-    batch_norm_op_ids: Vec<OpId>,
+/// One forward-pass step; `inputs`/`output` and layer indices are positions, not ids.
+#[derive(Debug, Clone)]
+struct Step {
+    kind: StepKind,
+    inputs: Vec<usize>,
+    output: usize,
 }
 
-/// Mapping info for a sub-graph within a compiled model.
+fn run_steps<B: Backend>(
+    steps: &[Step],
+    dense: &[Dense<B>],
+    batch_norms: &[BatchNormLayer<B>],
+    (input_idx, input): (usize, Tensor<B, 2>),
+    output_idx: usize,
+) -> Tensor<B, 2> {
+    let mut buffers = HashMap::from([(input_idx, input)]);
+    for step in steps {
+        let all = || step.inputs.iter().map(|i| buffers[i].clone());
+        let first = || buffers[&step.inputs[0]].clone();
+        let row = |v: &[f32], x: &Tensor<B, 2>| {
+            Tensor::<B, 1>::from_floats(v, &x.device()).reshape([1, -1])
+        };
+        let out = match &step.kind {
+            StepKind::Dense(l) => dense[*l].forward(first()),
+            StepKind::BatchNorm(l) => batch_norms[*l].forward(first()),
+            StepKind::Add => all().reduce(|a, b| a + b).unwrap(),
+            StepKind::Multiply => all().reduce(|a, b| a * b).unwrap(),
+            StepKind::Concat => Tensor::cat(all().collect(), 1),
+            StepKind::Scale(v) => {
+                let x = first();
+                let p = row(v, &x);
+                x * p
+            }
+            StepKind::Shift(v) => {
+                let x = first();
+                let p = row(v, &x);
+                x + p
+            }
+            StepKind::Activation(a) => a.apply(first()),
+        };
+        buffers.insert(step.output, out);
+    }
+    buffers.remove(&output_idx).unwrap()
+}
+
+/// A sub-graph's slice of the compiled model, with layer indices local to the sub-model.
 #[derive(Debug, Clone)]
 struct SubgraphMapping {
-    /// Which dense layer indices this sub-graph uses
     dense_layer_indices: Vec<usize>,
-    /// Which batch norm layer indices this sub-graph uses
     batch_norm_layer_indices: Vec<usize>,
-    /// The execution steps for this sub-graph
     steps: Vec<Step>,
-    /// Buffer index mapping for this sub-graph
-    buffer_index: HashMap<BufferId, usize>,
-    /// Input buffer ID for this sub-graph
-    input_buffer_id: BufferId,
-    /// Output buffer ID for this sub-graph
-    output_buffer_id: BufferId,
+    input: usize,
+    output: usize,
 }
 
-/// CompiledModel holds the initialized layers and execution steps.
-/// Derives Module to enable training with burn's optimizer.
+impl SubgraphMapping {
+    fn new(steps: &[Step], input: usize, output: usize) -> Self {
+        fn local(layers: &mut Vec<usize>, global: usize) -> usize {
+            layers.iter().position(|&l| l == global).unwrap_or_else(|| {
+                layers.push(global);
+                layers.len() - 1
+            })
+        }
+        let (mut dense, mut batch_norms) = (Vec::new(), Vec::new());
+        let steps = steps
+            .iter()
+            .cloned()
+            .map(|mut step| {
+                match &mut step.kind {
+                    StepKind::Dense(l) => *l = local(&mut dense, *l),
+                    StepKind::BatchNorm(l) => *l = local(&mut batch_norms, *l),
+                    _ => {}
+                }
+                step
+            })
+            .collect();
+        Self {
+            dense_layer_indices: dense,
+            batch_norm_layer_indices: batch_norms,
+            steps,
+            input,
+            output,
+        }
+    }
+}
+
+/// Maps ops to their layer index, for weight export.
+#[derive(Debug, Clone, Default)]
+struct ExportMetadata {
+    dense: HashMap<OpId, usize>,
+    batch_norms: HashMap<OpId, usize>,
+}
+
+/// A compiled graph with trainable weights (a Burn `Module`). Forward feeds the first input.
 #[derive(Module, Debug)]
 pub struct CompiledModel<B: Backend> {
-    /// Trainable dense layers
-    dense_layers: Vec<DenseLayer<B>>,
-    /// Trainable batch normalization layers
+    dense_layers: Vec<Dense<B>>,
     batch_norm_layers: Vec<BatchNormLayer<B>>,
-    /// Non-trainable graph metadata (wrapped in Ignored)
     #[module(ignore)]
     inputs: Ignored<Vec<InputBuffer>>,
     #[module(ignore)]
@@ -285,7 +211,6 @@ pub struct CompiledModel<B: Backend> {
 }
 
 impl<B: Backend> CompiledModel<B> {
-    /// Creates a new CompiledModel from input buffers and output buffer.
     pub fn new(
         inputs: Vec<InputBuffer>,
         output: DataBuffer,
@@ -294,29 +219,46 @@ impl<B: Backend> CompiledModel<B> {
         if inputs.is_empty() {
             return Err(ModelError::NoInputBuffer);
         }
-
-        let mut builder = GraphBuilder::new();
-
-        for input in &inputs {
-            builder.register_input(input);
-        }
-
-        builder.traverse(&output)?;
-
-        let (dense_layers, dense_op_ids) = builder.init_dense_layers::<B>(device);
-        let (batch_norm_layers, batch_norm_op_ids) = builder.init_batch_norm_layers::<B>(device);
-
-        let features: Vec<String> = inputs
+        let mut builder = GraphBuilder::default();
+        let mut visited: HashMap<BufferId, usize> = inputs
             .iter()
-            .filter_map(|i| i.features())
+            .enumerate()
+            .map(|(idx, input)| (input.id(), idx))
+            .collect();
+        builder.num_buffers = inputs.len();
+        builder.visit(&output, &mut visited, false)?;
+
+        let dense_layers = builder
+            .dense
+            .iter()
+            .map(|&(_, input, output, act)| {
+                DenseConfig::new(input, output)
+                    .with_activation(act)
+                    .init(device)
+            })
+            .collect();
+        let batch_norm_layers = builder
+            .batch_norms
+            .iter()
+            .map(|&(_, n, eps, center, scale)| BatchNormLayer::new(n, eps, center, scale, device))
+            .collect();
+        let export_metadata = ExportMetadata {
+            dense: builder
+                .dense
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (d.0, i))
+                .collect(),
+            batch_norms: (builder.batch_norms.iter().enumerate())
+                .map(|(i, b)| (b.0, i))
+                .collect(),
+        };
+        let features = inputs
+            .iter()
+            .filter_map(InputBuffer::features)
             .flatten()
             .cloned()
             .collect();
-
-        let export_metadata = ExportMetadata {
-            dense_op_ids,
-            batch_norm_op_ids,
-        };
 
         Ok(Self {
             dense_layers,
@@ -324,529 +266,201 @@ impl<B: Backend> CompiledModel<B> {
             inputs: Ignored(inputs),
             output: Ignored(output),
             steps: Ignored(builder.steps),
-            buffer_index: Ignored(builder.buffer_index),
+            buffer_index: Ignored(visited),
             features: Ignored(features),
             export_metadata: Ignored(export_metadata),
-            subgraph_mappings: Ignored(builder.subgraph_mappings),
+            subgraph_mappings: Ignored(builder.subgraphs),
         })
     }
 
-    /// Performs forward pass through the model.
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let mut buffers: HashMap<usize, Tensor<B, 2>> = HashMap::new();
-
-        let input_idx = self.buffer_index.0[&self.inputs.0[0].id()];
-        buffers.insert(input_idx, input);
-
-        for step in &self.steps.0 {
-            match step {
-                Step::Dense {
-                    layer_index,
-                    input,
-                    output,
-                } => {
-                    let in_idx = self.buffer_index.0[input];
-                    let out_idx = self.buffer_index.0[output];
-                    let layer = &self.dense_layers[*layer_index];
-                    let result = layer.forward(buffers[&in_idx].clone());
-                    buffers.insert(out_idx, result);
-                }
-                Step::Add { inputs, output } => {
-                    let out_idx = self.buffer_index.0[output];
-                    let mut result = buffers[&self.buffer_index.0[&inputs[0]]].clone();
-                    for buf_id in &inputs[1..] {
-                        result = result.add(buffers[&self.buffer_index.0[buf_id]].clone());
-                    }
-                    buffers.insert(out_idx, result);
-                }
-                Step::Multiply { inputs, output } => {
-                    let out_idx = self.buffer_index.0[output];
-                    let mut result = buffers[&self.buffer_index.0[&inputs[0]]].clone();
-                    for buf_id in &inputs[1..] {
-                        result = result.mul(buffers[&self.buffer_index.0[buf_id]].clone());
-                    }
-                    buffers.insert(out_idx, result);
-                }
-                Step::Concat { inputs, output } => {
-                    let out_idx = self.buffer_index.0[output];
-                    let tensors: Vec<Tensor<B, 2>> = inputs
-                        .iter()
-                        .map(|buf_id| buffers[&self.buffer_index.0[buf_id]].clone())
-                        .collect();
-                    let result = Tensor::cat(tensors, 1);
-                    buffers.insert(out_idx, result);
-                }
-                Step::Softmax { input, output } => {
-                    let in_idx = self.buffer_index.0[input];
-                    let out_idx = self.buffer_index.0[output];
-                    let result = burn::tensor::activation::softmax(buffers[&in_idx].clone(), 1);
-                    buffers.insert(out_idx, result);
-                }
-                Step::Scale {
-                    input,
-                    output,
-                    vector,
-                } => {
-                    let in_idx = self.buffer_index.0[input];
-                    let out_idx = self.buffer_index.0[output];
-                    let in_tensor = buffers[&in_idx].clone();
-                    let device = in_tensor.device();
-                    let scale_tensor =
-                        Tensor::<B, 1>::from_floats(vector.as_slice(), &device).reshape([1, -1]);
-                    let result = in_tensor.mul(scale_tensor);
-                    buffers.insert(out_idx, result);
-                }
-                Step::Shift {
-                    input,
-                    output,
-                    vector,
-                } => {
-                    let in_idx = self.buffer_index.0[input];
-                    let out_idx = self.buffer_index.0[output];
-                    let in_tensor = buffers[&in_idx].clone();
-                    let device = in_tensor.device();
-                    let shift_tensor =
-                        Tensor::<B, 1>::from_floats(vector.as_slice(), &device).reshape([1, -1]);
-                    let result = in_tensor.add(shift_tensor);
-                    buffers.insert(out_idx, result);
-                }
-                Step::BatchNorm {
-                    layer_index,
-                    input,
-                    output,
-                } => {
-                    let in_idx = self.buffer_index.0[input];
-                    let out_idx = self.buffer_index.0[output];
-                    let layer = &self.batch_norm_layers[*layer_index];
-                    let result = layer.forward(buffers[&in_idx].clone());
-                    buffers.insert(out_idx, result);
-                }
-                Step::StandaloneActivation {
-                    input,
-                    output,
-                    activation,
-                } => {
-                    let in_idx = self.buffer_index.0[input];
-                    let out_idx = self.buffer_index.0[output];
-                    let result = activation.apply(buffers[&in_idx].clone());
-                    buffers.insert(out_idx, result);
-                }
-            }
-        }
-
-        let output_idx = self.buffer_index.0[&self.output.0.id()];
-        buffers.remove(&output_idx).unwrap()
+        let index = &self.buffer_index.0;
+        run_steps(
+            &self.steps,
+            &self.dense_layers,
+            &self.batch_norm_layers,
+            (index[&self.inputs[0].id()], input),
+            index[&self.output.id()],
+        )
     }
 
-    /// Returns the input feature names.
     pub fn features(&self) -> &[String] {
-        &self.features.0
+        &self.features
     }
 
-    /// Returns the number of input features.
     pub fn feature_size(&self) -> usize {
-        self.inputs.0.iter().map(|i| i.size()).sum()
+        self.inputs.iter().map(InputBuffer::size).sum()
     }
 
-    /// Returns the output size of the model.
     pub fn output_size(&self) -> usize {
-        self.output.0.size()
+        self.output.size()
     }
 
-    /// Exports the model to instruction model JSON format.
     pub fn export_to_instruction_model(&self) -> Result<String, serde_json::Error> {
-        let export = self.to_instruction_model_info();
-        serde_json::to_string_pretty(&export)
+        serde_json::to_string_pretty(&self.to_instruction_model_info())
     }
 
-    /// Converts the model to an InstructionModelExport struct.
     pub fn to_instruction_model_info(&self) -> InstructionModelExport {
         let mut ctx = CompileContext::new();
-
-        for input in &self.inputs.0 {
+        for input in self.inputs.iter() {
             ctx.register_input(input.id(), input.size(), input.features());
         }
-
-        self.compile_buffer(&self.output.0, &mut ctx);
-
+        let mut visited = std::mem::take(&mut ctx.visited_buffers);
+        self.compile_buffer(&self.output, &mut ctx, &mut visited);
+        ctx.visited_buffers = visited;
         ctx.into_export()
     }
 
-    /// Recursively compiles a buffer and its dependencies.
-    fn compile_buffer(&self, buffer: &DataBuffer, ctx: &mut CompileContext) -> usize {
-        if let Some(&idx) = ctx.visited_buffers.get(&buffer.id()) {
-            return idx;
-        }
-
-        let Some(producer) = buffer.producer() else {
-            return ctx.visited_buffers[&buffer.id()];
-        };
-
-        // Recursively compile inputs first
-        let input_indices: Vec<usize> = buffer
-            .inputs()
-            .iter()
-            .map(|inp| self.compile_buffer(inp, ctx))
-            .collect();
-
-        let output_idx = match producer {
-            Producer::Op(op) => {
-                self.fill_dense_weights(op, ctx);
-                self.compile_operation(op, &input_indices, ctx)
-            }
-            Producer::SubGraph {
-                input_ids, output, ..
-            } => {
-                // Create a LOCAL visited map for this sub-graph application.
-                // Pre-populate with the input mapping: sub-graph input ID -> actual buffer index
-                let mut local_visited: HashMap<BufferId, usize> = HashMap::new();
-                for (&sub_id, &actual_idx) in input_ids.iter().zip(input_indices.iter()) {
-                    local_visited.insert(sub_id, actual_idx);
-                }
-
-                // Compile the sub-graph with the local visited map
-                self.compile_subgraph_buffer(output, ctx, &mut local_visited)
-            }
-        };
-
-        ctx.visited_buffers.insert(buffer.id(), output_idx);
-
-        output_idx
-    }
-
-    /// Compiles a sub-graph buffer using a local visited map.
-    /// This ensures each sub-graph application creates new buffers.
-    fn compile_subgraph_buffer(
+    /// `visited` is the top-level map, or a fresh per-application map inside a sub-graph so that
+    /// every application gets its own buffers while sharing weights.
+    fn compile_buffer(
         &self,
         buffer: &DataBuffer,
         ctx: &mut CompileContext,
-        local_visited: &mut HashMap<BufferId, usize>,
+        visited: &mut HashMap<BufferId, usize>,
     ) -> usize {
-        // Check if this buffer is already in local_visited (remapped input or already compiled in this application)
-        if let Some(&idx) = local_visited.get(&buffer.id()) {
+        if let Some(&idx) = visited.get(&buffer.id()) {
             return idx;
         }
-
-        let Some(producer) = buffer.producer() else {
-            panic!(
-                "Sub-graph buffer {} has no producer and is not a remapped input",
-                buffer.id()
-            );
-        };
-
-        // Recursively compile inputs using local_visited
-        let input_indices: Vec<usize> = buffer
+        let producer = buffer
+            .producer()
+            .expect("graph structure is validated in CompiledModel::new");
+        let inputs: Vec<usize> = buffer
             .inputs()
             .iter()
-            .map(|inp| self.compile_subgraph_buffer(inp, ctx, local_visited))
+            .map(|b| self.compile_buffer(b, ctx, visited))
             .collect();
-
-        let output_idx = match producer {
-            Producer::Op(op) => {
-                self.fill_dense_weights(op, ctx);
-                self.compile_operation(op, &input_indices, ctx)
-            }
+        let idx = match producer {
+            Producer::Op(op) => self.compile_operation(op, &inputs, ctx),
             Producer::SubGraph {
                 input_ids, output, ..
             } => {
-                // Nested sub-graph: create new local_visited
-                let mut nested_visited: HashMap<BufferId, usize> = HashMap::new();
-                for (&sub_id, &actual_idx) in input_ids.iter().zip(input_indices.iter()) {
-                    nested_visited.insert(sub_id, actual_idx);
-                }
-
-                // Recursively compile the nested sub-graph
-                self.compile_subgraph_buffer(output, ctx, &mut nested_visited)
+                let mut local = input_ids.iter().copied().zip(inputs).collect();
+                self.compile_buffer(output, ctx, &mut local)
             }
         };
-
-        // Track in local_visited for DAG handling within this sub-graph
-        local_visited.insert(buffer.id(), output_idx);
-
-        output_idx
-    }
-
-    fn fill_dense_weights(&self, producer: &Operation, ctx: &mut CompileContext) {
-        let Operation::Dense { id, .. } = producer else {
-            return;
-        };
-        // Find layer index from OpId using export_metadata
-        let Some(layer_index) = self
-            .export_metadata
-            .0
-            .dense_op_ids
-            .iter()
-            .position(|op_id| op_id == id)
-        else {
-            return;
-        };
-        let layer = &self.dense_layers[layer_index];
-        let weight_idx = ctx.get_or_create_weight_index(*id);
-        ctx.set_weights(weight_idx, layer.weights_to_vec(), layer.bias_to_vec());
+        visited.insert(buffer.id(), idx);
+        idx
     }
 
     fn compile_operation(
         &self,
-        producer: &Operation,
-        input_indices: &[usize],
+        op: &Operation,
+        inputs: &[usize],
         ctx: &mut CompileContext,
     ) -> usize {
-        let Operation::BatchNorm { id, .. } = producer else {
-            return producer.compile(input_indices, ctx);
-        };
-        // Find layer index from OpId using export_metadata
-        let Some(layer_index) = self
-            .export_metadata
-            .0
-            .batch_norm_op_ids
-            .iter()
-            .position(|op_id| op_id == id)
-        else {
-            return producer.compile(input_indices, ctx);
-        };
-        let layer = &self.batch_norm_layers[layer_index];
-        let (center, std, beta) = layer.get_normalization_params();
-        producer.compile_batch_norm(input_indices, ctx, &center, &std, &beta)
+        let meta = &self.export_metadata.0;
+        match op {
+            Operation::Dense { id, .. } if ctx.get_weight_index(*id).is_none() => {
+                let layer = &self.dense_layers[meta.dense[id]];
+                ctx.store_weights(*id, layer.weights_to_vec(), layer.bias_to_vec());
+            }
+            Operation::BatchNorm { id, .. } => {
+                let (center, std, beta) =
+                    self.batch_norm_layers[meta.batch_norms[id]].normalization_params();
+                return op.compile_batch_norm(inputs, ctx, &center, &std, &beta);
+            }
+            _ => {}
+        }
+        op.compile(inputs, ctx)
     }
 
-    /// Extracts a sub-model with the current weights.
-    /// Call this after training to get a sub-model with trained weights.
-    pub fn submodel(&self, graph: &super::core::ModelGraph) -> SubModel<B> {
-        let graph_id = graph.id();
+    /// Extracts the sub-model for `graph` (applied somewhere in this model) with current weights.
+    pub fn submodel(&self, graph: &ModelGraph) -> SubModel<B> {
         let mapping = self
             .subgraph_mappings
-            .0
-            .get(&graph_id)
+            .get(&graph.id())
             .expect("Sub-graph not found in compiled model");
-
-        let dense_layers: Vec<DenseLayer<B>> = mapping
-            .dense_layer_indices
-            .iter()
-            .map(|&idx| self.dense_layers[idx].clone())
-            .collect();
-
-        let batch_norm_layers: Vec<BatchNormLayer<B>> = mapping
-            .batch_norm_layer_indices
-            .iter()
-            .map(|&idx| self.batch_norm_layers[idx].clone())
-            .collect();
-
         SubModel {
-            dense_layers,
-            batch_norm_layers,
-            steps: mapping.steps.clone(),
-            buffer_index: mapping.buffer_index.clone(),
-            input_buffer_id: mapping.input_buffer_id,
-            output_buffer_id: mapping.output_buffer_id,
-            dense_index_map: mapping
+            dense_layers: mapping
                 .dense_layer_indices
                 .iter()
-                .enumerate()
-                .map(|(new_idx, &old_idx)| (old_idx, new_idx))
+                .map(|&i| self.dense_layers[i].clone())
                 .collect(),
-            batch_norm_index_map: mapping
+            batch_norm_layers: mapping
                 .batch_norm_layer_indices
                 .iter()
-                .enumerate()
-                .map(|(new_idx, &old_idx)| (old_idx, new_idx))
+                .map(|&i| self.batch_norm_layers[i].clone())
                 .collect(),
+            steps: mapping.steps.clone(),
+            input: mapping.input,
+            output: mapping.output,
         }
     }
 }
 
-/// A sub-model extracted from a CompiledModel with cloned weights.
-/// Call `submodel()` after training to get a sub-model with trained weights.
+/// A sub-model extracted from a [`CompiledModel`] with cloned weights.
 #[derive(Debug, Clone)]
 pub struct SubModel<B: Backend> {
-    dense_layers: Vec<DenseLayer<B>>,
+    dense_layers: Vec<Dense<B>>,
     batch_norm_layers: Vec<BatchNormLayer<B>>,
     steps: Vec<Step>,
-    buffer_index: HashMap<BufferId, usize>,
-    input_buffer_id: BufferId,
-    output_buffer_id: BufferId,
-    dense_index_map: HashMap<usize, usize>,
-    batch_norm_index_map: HashMap<usize, usize>,
+    input: usize,
+    output: usize,
 }
 
 impl<B: Backend> SubModel<B> {
-    /// Performs forward pass through the sub-model.
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let mut buffers: HashMap<usize, Tensor<B, 2>> = HashMap::new();
-
-        let input_idx = self.buffer_index[&self.input_buffer_id];
-        buffers.insert(input_idx, input);
-
-        for step in &self.steps {
-            match step {
-                Step::Dense {
-                    layer_index,
-                    input,
-                    output,
-                } => {
-                    let in_idx = self.buffer_index[input];
-                    let out_idx = self.buffer_index[output];
-                    let local_idx = self.dense_index_map[layer_index];
-                    let layer = &self.dense_layers[local_idx];
-                    let result = layer.forward(buffers[&in_idx].clone());
-                    buffers.insert(out_idx, result);
-                }
-                Step::Add { inputs, output } => {
-                    let out_idx = self.buffer_index[output];
-                    let mut result = buffers[&self.buffer_index[&inputs[0]]].clone();
-                    for buf_id in &inputs[1..] {
-                        result = result.add(buffers[&self.buffer_index[buf_id]].clone());
-                    }
-                    buffers.insert(out_idx, result);
-                }
-                Step::Multiply { inputs, output } => {
-                    let out_idx = self.buffer_index[output];
-                    let mut result = buffers[&self.buffer_index[&inputs[0]]].clone();
-                    for buf_id in &inputs[1..] {
-                        result = result.mul(buffers[&self.buffer_index[buf_id]].clone());
-                    }
-                    buffers.insert(out_idx, result);
-                }
-                Step::Concat { inputs, output } => {
-                    let out_idx = self.buffer_index[output];
-                    let tensors: Vec<Tensor<B, 2>> = inputs
-                        .iter()
-                        .map(|buf_id| buffers[&self.buffer_index[buf_id]].clone())
-                        .collect();
-                    let result = Tensor::cat(tensors, 1);
-                    buffers.insert(out_idx, result);
-                }
-                Step::Softmax { input, output } => {
-                    let in_idx = self.buffer_index[input];
-                    let out_idx = self.buffer_index[output];
-                    let result = burn::tensor::activation::softmax(buffers[&in_idx].clone(), 1);
-                    buffers.insert(out_idx, result);
-                }
-                Step::Scale {
-                    input,
-                    output,
-                    vector,
-                } => {
-                    let in_idx = self.buffer_index[input];
-                    let out_idx = self.buffer_index[output];
-                    let in_tensor = buffers[&in_idx].clone();
-                    let device = in_tensor.device();
-                    let scale_tensor =
-                        Tensor::<B, 1>::from_floats(vector.as_slice(), &device).reshape([1, -1]);
-                    let result = in_tensor.mul(scale_tensor);
-                    buffers.insert(out_idx, result);
-                }
-                Step::Shift {
-                    input,
-                    output,
-                    vector,
-                } => {
-                    let in_idx = self.buffer_index[input];
-                    let out_idx = self.buffer_index[output];
-                    let in_tensor = buffers[&in_idx].clone();
-                    let device = in_tensor.device();
-                    let shift_tensor =
-                        Tensor::<B, 1>::from_floats(vector.as_slice(), &device).reshape([1, -1]);
-                    let result = in_tensor.add(shift_tensor);
-                    buffers.insert(out_idx, result);
-                }
-                Step::BatchNorm {
-                    layer_index,
-                    input,
-                    output,
-                } => {
-                    let in_idx = self.buffer_index[input];
-                    let out_idx = self.buffer_index[output];
-                    let local_idx = self.batch_norm_index_map[layer_index];
-                    let layer = &self.batch_norm_layers[local_idx];
-                    let result = layer.forward(buffers[&in_idx].clone());
-                    buffers.insert(out_idx, result);
-                }
-                Step::StandaloneActivation {
-                    input,
-                    output,
-                    activation,
-                } => {
-                    let in_idx = self.buffer_index[input];
-                    let out_idx = self.buffer_index[output];
-                    let result = activation.apply(buffers[&in_idx].clone());
-                    buffers.insert(out_idx, result);
-                }
-            }
-        }
-
-        let output_idx = self.buffer_index[&self.output_buffer_id];
-        buffers.remove(&output_idx).unwrap()
+        run_steps(
+            &self.steps,
+            &self.dense_layers,
+            &self.batch_norm_layers,
+            (self.input, input),
+            self.output,
+        )
     }
 }
 
-/// Builder for constructing CompiledModel execution order.
+/// Flattens the graph (inlining sub-graphs) into steps and layer specs.
+#[derive(Default)]
 struct GraphBuilder {
-    buffer_index: HashMap<BufferId, usize>,
-    next_idx: usize,
+    num_buffers: usize,
     steps: Vec<Step>,
-    /// Maps OpId -> (input_size, output_size, activation, layer_index)
-    dense_info: HashMap<OpId, (usize, usize, Activation, usize)>,
-    /// Maps OpId -> (num_features, epsilon, center, scale, layer_index)
-    batch_norm_info: HashMap<OpId, (usize, f32, bool, bool, usize)>,
-    visited: HashMap<BufferId, bool>,
-    next_dense_index: usize,
-    next_batch_norm_index: usize,
-    /// Counter for generating unique buffer IDs for sub-graph internals.
-    /// Starts at a high value to avoid collision with global buffer IDs.
-    next_subgraph_buffer_id: BufferId,
-    /// Maps GraphId to SubgraphMapping for sub-model extraction.
-    subgraph_mappings: HashMap<GraphId, SubgraphMapping>,
+    /// Per layer index: (op, input size, output size, activation).
+    dense: Vec<(OpId, usize, usize, Activation)>,
+    /// Per layer index: (op, features, epsilon, center, scale).
+    batch_norms: Vec<(OpId, usize, f32, bool, bool)>,
+    subgraphs: HashMap<GraphId, SubgraphMapping>,
 }
 
 impl GraphBuilder {
-    fn new() -> Self {
-        Self {
-            buffer_index: HashMap::new(),
-            next_idx: 0,
-            steps: Vec::new(),
-            dense_info: HashMap::new(),
-            batch_norm_info: HashMap::new(),
-            visited: HashMap::new(),
-            next_dense_index: 0,
-            next_batch_norm_index: 0,
-            next_subgraph_buffer_id: usize::MAX / 2,
-            subgraph_mappings: HashMap::new(),
+    fn visit(
+        &mut self,
+        buffer: &DataBuffer,
+        visited: &mut HashMap<BufferId, usize>,
+        in_subgraph: bool,
+    ) -> Result<usize, ModelError> {
+        if let Some(&idx) = visited.get(&buffer.id()) {
+            return Ok(idx);
         }
-    }
-
-    fn register_input(&mut self, input: &InputBuffer) {
-        self.buffer_index.insert(input.id(), self.next_idx);
-        self.next_idx += 1;
-        self.visited.insert(input.id(), true);
-    }
-
-    fn traverse(&mut self, buffer: &DataBuffer) -> Result<(), ModelError> {
-        if self.visited.contains_key(&buffer.id()) {
-            return Ok(());
-        }
-
         let Some(producer) = buffer.producer() else {
-            return Err(ModelError::InvalidGraph(
-                "Buffer has no producer and is not a registered input".to_string(),
-            ));
+            return Err(ModelError::InvalidGraph(if in_subgraph {
+                format!(
+                    "Sub-graph buffer {} has no producer and is not a remapped input",
+                    buffer.id()
+                )
+            } else {
+                "Buffer has no producer and is not a registered input".to_string()
+            }));
         };
+        let inputs = buffer
+            .inputs()
+            .iter()
+            .map(|b| self.visit(b, visited, in_subgraph))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        for input in buffer.inputs() {
-            self.traverse(input)?;
-        }
-
-        let inputs = buffer.inputs();
-        let input_size = if inputs.is_empty() {
-            0
-        } else {
-            inputs[0].size()
-        };
-
-        match producer {
+        let idx = match producer {
             Producer::Op(op) => {
-                self.buffer_index.insert(buffer.id(), self.next_idx);
-                self.next_idx += 1;
-                self.traverse_operation(op, buffer, inputs, input_size);
+                let input_size = buffer.inputs().first().map_or(0, DataBuffer::size);
+                let kind = self.step_kind(op, input_size);
+                let output = self.num_buffers;
+                self.num_buffers += 1;
+                self.steps.push(Step {
+                    kind,
+                    inputs,
+                    output,
+                });
+                output
             }
             Producer::SubGraph {
                 input_ids,
@@ -854,505 +468,66 @@ impl GraphBuilder {
                 graph_id,
                 ..
             } => {
-                // Record starting state for subgraph mapping
-                let step_start = self.steps.len();
-                let dense_start = self.next_dense_index;
-                let batch_norm_start = self.next_batch_norm_index;
-                let input_buffer_id = inputs[0].id();
-
-                // Build mapping: sub-graph input IDs -> actual input buffer IDs
-                let input_remap: HashMap<BufferId, BufferId> = input_ids
+                let start = self.steps.len();
+                let mut local = input_ids
                     .iter()
-                    .zip(inputs.iter())
-                    .map(|(&sub_id, actual_buf)| (sub_id, actual_buf.id()))
+                    .copied()
+                    .zip(inputs.iter().copied())
                     .collect();
-
-                // Traverse the sub-graph's output, which inlines all operations
-                let output_idx = self.traverse_subgraph_inline(output, &input_remap)?;
-
-                // The outer buffer ID maps to the same index as the sub-graph output
-                self.buffer_index.insert(buffer.id(), output_idx);
-
-                // Record subgraph mapping
-                let dense_layer_indices: Vec<usize> =
-                    (dense_start..self.next_dense_index).collect();
-                let batch_norm_layer_indices: Vec<usize> =
-                    (batch_norm_start..self.next_batch_norm_index).collect();
-                let subgraph_steps = self.steps[step_start..].to_vec();
-
-                let mut subgraph_buffer_ids: Vec<BufferId> = vec![input_buffer_id];
-                for step in &subgraph_steps {
-                    match step {
-                        Step::Dense { input, output, .. } => {
-                            subgraph_buffer_ids.push(*input);
-                            subgraph_buffer_ids.push(*output);
-                        }
-                        Step::Add { inputs, output, .. } => {
-                            subgraph_buffer_ids.extend(inputs.iter().copied());
-                            subgraph_buffer_ids.push(*output);
-                        }
-                        Step::Multiply { inputs, output, .. } => {
-                            subgraph_buffer_ids.extend(inputs.iter().copied());
-                            subgraph_buffer_ids.push(*output);
-                        }
-                        Step::Concat { inputs, output, .. } => {
-                            subgraph_buffer_ids.extend(inputs.iter().copied());
-                            subgraph_buffer_ids.push(*output);
-                        }
-                        Step::Softmax { input, output, .. } => {
-                            subgraph_buffer_ids.push(*input);
-                            subgraph_buffer_ids.push(*output);
-                        }
-                        Step::Scale { input, output, .. } => {
-                            subgraph_buffer_ids.push(*input);
-                            subgraph_buffer_ids.push(*output);
-                        }
-                        Step::Shift { input, output, .. } => {
-                            subgraph_buffer_ids.push(*input);
-                            subgraph_buffer_ids.push(*output);
-                        }
-                        Step::BatchNorm { input, output, .. } => {
-                            subgraph_buffer_ids.push(*input);
-                            subgraph_buffer_ids.push(*output);
-                        }
-                        Step::StandaloneActivation { input, output, .. } => {
-                            subgraph_buffer_ids.push(*input);
-                            subgraph_buffer_ids.push(*output);
-                        }
-                    }
+                let out = self.visit(output, &mut local, true)?;
+                if let Some(&input) = inputs.first() {
+                    self.subgraphs
+                        .entry(*graph_id)
+                        .or_insert_with(|| SubgraphMapping::new(&self.steps[start..], input, out));
                 }
-
-                let subgraph_buffer_index: HashMap<BufferId, usize> = subgraph_buffer_ids
-                    .into_iter()
-                    .filter_map(|buf_id| self.buffer_index.get(&buf_id).map(|&idx| (buf_id, idx)))
-                    .collect();
-
-                // Find output buffer id from the last step
-                let output_buffer_id = subgraph_steps
-                    .last()
-                    .map(|step| match step {
-                        Step::Dense { output, .. } => *output,
-                        Step::Add { output, .. } => *output,
-                        Step::Multiply { output, .. } => *output,
-                        Step::Concat { output, .. } => *output,
-                        Step::Softmax { output, .. } => *output,
-                        Step::Scale { output, .. } => *output,
-                        Step::Shift { output, .. } => *output,
-                        Step::BatchNorm { output, .. } => *output,
-                        Step::StandaloneActivation { output, .. } => *output,
-                    })
-                    .unwrap_or(input_buffer_id);
-
-                self.subgraph_mappings.insert(
-                    *graph_id,
-                    SubgraphMapping {
-                        dense_layer_indices,
-                        batch_norm_layer_indices,
-                        steps: subgraph_steps,
-                        buffer_index: subgraph_buffer_index,
-                        input_buffer_id,
-                        output_buffer_id,
-                    },
-                );
+                out
             }
-        }
-
-        self.visited.insert(buffer.id(), true);
-        Ok(())
+        };
+        visited.insert(buffer.id(), idx);
+        Ok(idx)
     }
 
-    fn traverse_operation(
-        &mut self,
-        op: &Operation,
-        buffer: &DataBuffer,
-        inputs: &[DataBuffer],
-        input_size: usize,
-    ) {
+    fn step_kind(&mut self, op: &Operation, input_size: usize) -> StepKind {
+        fn layer<T>(layers: &mut Vec<T>, id: OpId, op_id: impl Fn(&T) -> OpId, new: T) -> usize {
+            layers
+                .iter()
+                .position(|l| op_id(l) == id)
+                .unwrap_or_else(|| {
+                    layers.push(new);
+                    layers.len() - 1
+                })
+        }
         match op {
             Operation::Dense {
                 id,
                 output_size,
                 activation,
-            } => {
-                let layer_index = if let Some((_, _, _, idx)) = self.dense_info.get(id) {
-                    *idx
-                } else {
-                    let idx = self.next_dense_index;
-                    self.dense_info
-                        .insert(*id, (input_size, *output_size, *activation, idx));
-                    self.next_dense_index += 1;
-                    idx
-                };
-                self.steps.push(Step::Dense {
-                    layer_index,
-                    input: inputs[0].id(),
-                    output: buffer.id(),
-                });
-            }
-            Operation::Add { .. } => {
-                let input_ids: Vec<BufferId> = inputs.iter().map(|b| b.id()).collect();
-                self.steps.push(Step::Add {
-                    inputs: input_ids,
-                    output: buffer.id(),
-                });
-            }
-            Operation::Multiply { .. } => {
-                let input_ids: Vec<BufferId> = inputs.iter().map(|b| b.id()).collect();
-                self.steps.push(Step::Multiply {
-                    inputs: input_ids,
-                    output: buffer.id(),
-                });
-            }
-            Operation::Concat { .. } => {
-                let input_ids: Vec<BufferId> = inputs.iter().map(|b| b.id()).collect();
-                self.steps.push(Step::Concat {
-                    inputs: input_ids,
-                    output: buffer.id(),
-                });
-            }
-            Operation::Softmax { .. } => {
-                self.steps.push(Step::Softmax {
-                    input: inputs[0].id(),
-                    output: buffer.id(),
-                });
-            }
-            Operation::Scale { vector, .. } => {
-                self.steps.push(Step::Scale {
-                    input: inputs[0].id(),
-                    output: buffer.id(),
-                    vector: vector.clone(),
-                });
-            }
-            Operation::Shift { vector, .. } => {
-                self.steps.push(Step::Shift {
-                    input: inputs[0].id(),
-                    output: buffer.id(),
-                    vector: vector.clone(),
-                });
-            }
+            } => StepKind::Dense(layer(
+                &mut self.dense,
+                *id,
+                |d| d.0,
+                (*id, input_size, *output_size, *activation),
+            )),
             Operation::BatchNorm {
                 id,
                 epsilon,
                 center,
                 scale,
                 ..
-            } => {
-                let layer_index = if let Some((_, _, _, _, idx)) = self.batch_norm_info.get(id) {
-                    *idx
-                } else {
-                    let idx = self.next_batch_norm_index;
-                    self.batch_norm_info
-                        .insert(*id, (input_size, *epsilon, *center, *scale, idx));
-                    self.next_batch_norm_index += 1;
-                    idx
-                };
-                self.steps.push(Step::BatchNorm {
-                    layer_index,
-                    input: inputs[0].id(),
-                    output: buffer.id(),
-                });
-            }
-            Operation::StandaloneActivation { activation, .. } => {
-                self.steps.push(Step::StandaloneActivation {
-                    input: inputs[0].id(),
-                    output: buffer.id(),
-                    activation: *activation,
-                });
-            }
+            } => StepKind::BatchNorm(layer(
+                &mut self.batch_norms,
+                *id,
+                |b| b.0,
+                (*id, input_size, *epsilon, *center, *scale),
+            )),
+            Operation::Add { .. } => StepKind::Add,
+            Operation::Multiply { .. } => StepKind::Multiply,
+            Operation::Concat { .. } => StepKind::Concat,
+            Operation::Softmax { .. } => StepKind::Activation(Activation::Softmax),
+            Operation::Scale { vector, .. } => StepKind::Scale(vector.clone()),
+            Operation::Shift { vector, .. } => StepKind::Shift(vector.clone()),
+            Operation::StandaloneActivation { activation, .. } => StepKind::Activation(*activation),
         }
-    }
-
-    /// Inlines a sub-graph by traversing its internal structure,
-    /// creating buffer entries and Steps for all operations.
-    /// Returns the buffer index of the sub-graph's output.
-    ///
-    /// Uses a LOCAL visited map (like Python's visited dict) so each sub-graph
-    /// application creates new buffers, enabling multiple applications of the
-    /// same sub-model with shared weights.
-    fn traverse_subgraph_inline(
-        &mut self,
-        output: &DataBuffer,
-        input_remap: &HashMap<BufferId, BufferId>,
-    ) -> Result<usize, ModelError> {
-        // Create a LOCAL visited map for this sub-graph application.
-        // Maps sub-graph internal buffer IDs to NEW buffer IDs for this application.
-        // Pre-populate with the input mapping: sub-graph input ID -> actual buffer ID
-        let mut local_visited: HashMap<BufferId, BufferId> = HashMap::new();
-        for (&sub_id, &actual_id) in input_remap {
-            // The actual_id is already a valid buffer ID in buffer_index
-            local_visited.insert(sub_id, actual_id);
-        }
-        self.traverse_subgraph_buffer_inline(output, &mut local_visited)
-    }
-
-    /// Recursively traverses a sub-graph buffer, inlining operations.
-    /// Uses local_visited to track buffers within THIS application only.
-    /// local_visited maps sub-graph internal buffer IDs to NEW buffer IDs for this application.
-    fn traverse_subgraph_buffer_inline(
-        &mut self,
-        buffer: &DataBuffer,
-        local_visited: &mut HashMap<BufferId, BufferId>,
-    ) -> Result<usize, ModelError> {
-        // Check if already visited IN THIS APPLICATION (enables DAG within sub-graph)
-        if let Some(&new_id) = local_visited.get(&buffer.id()) {
-            // Return the index for the new buffer ID
-            return Ok(self.buffer_index[&new_id]);
-        }
-
-        // Must have a producer (inputs should be in local_visited)
-        let Some(producer) = buffer.producer() else {
-            return Err(ModelError::InvalidGraph(format!(
-                "Sub-graph buffer {} has no producer and is not a remapped input",
-                buffer.id()
-            )));
-        };
-
-        // First, recursively process all input buffers
-        let input_indices: Vec<usize> = buffer
-            .inputs()
-            .iter()
-            .map(|inp| self.traverse_subgraph_buffer_inline(inp, local_visited))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let inputs = buffer.inputs();
-        let input_size = if inputs.is_empty() {
-            0
-        } else {
-            inputs[0].size()
-        };
-
-        // Register this buffer and create the appropriate Step
-        match producer {
-            Producer::Op(op) => {
-                // Allocate a NEW buffer index for this operation's output
-                let output_idx = self.next_idx;
-                self.next_idx += 1;
-
-                // Generate a NEW unique BufferId for this application's buffer
-                // Uses a separate high counter to avoid collision with global buffer IDs
-                let new_buffer_id = self.next_subgraph_buffer_id;
-                self.next_subgraph_buffer_id += 1;
-
-                // Register in buffer_index for forward pass
-                self.buffer_index.insert(new_buffer_id, output_idx);
-
-                // Track mapping: sub-graph buffer ID -> new buffer ID
-                local_visited.insert(buffer.id(), new_buffer_id);
-
-                // Create the Step for this operation using NEW buffer IDs
-                self.traverse_operation_with_inputs_new_ids(
-                    op,
-                    new_buffer_id,
-                    &input_indices,
-                    input_size,
-                    local_visited,
-                );
-
-                Ok(output_idx)
-            }
-            Producer::SubGraph {
-                input_ids,
-                output: inner_output,
-                ..
-            } => {
-                // Nested sub-graph: create new local_visited from current state
-                // Map nested input IDs to the NEW buffer IDs from the current application
-                let mut nested_visited: HashMap<BufferId, BufferId> = HashMap::new();
-                for (&sub_id, inp) in input_ids.iter().zip(buffer.inputs().iter()) {
-                    // Get the new buffer ID for this input
-                    let new_id = local_visited[&inp.id()];
-                    nested_visited.insert(sub_id, new_id);
-                }
-
-                // Recursively inline the nested sub-graph
-                let output_idx =
-                    self.traverse_subgraph_buffer_inline(inner_output, &mut nested_visited)?;
-
-                // The new buffer ID is whatever the nested sub-graph output mapped to
-                let nested_output_new_id = nested_visited[&inner_output.id()];
-                local_visited.insert(buffer.id(), nested_output_new_id);
-
-                Ok(output_idx)
-            }
-        }
-    }
-
-    /// Creates a Step for an operation in a sub-graph, using NEW buffer IDs.
-    /// This is used during sub-graph inlining where we generate new buffer IDs
-    /// for each application to avoid conflicts.
-    fn traverse_operation_with_inputs_new_ids(
-        &mut self,
-        op: &Operation,
-        new_output_id: BufferId,
-        input_indices: &[usize],
-        input_size: usize,
-        local_visited: &HashMap<BufferId, BufferId>,
-    ) {
-        // Get the input buffer IDs (these are the NEW buffer IDs from local_visited)
-        let input_ids: Vec<BufferId> = input_indices
-            .iter()
-            .map(|&idx| {
-                // Find the NEW buffer ID that maps to this index
-                self.buffer_index
-                    .iter()
-                    .find(|entry| *entry.1 == idx)
-                    .map(|entry| *entry.0)
-                    .unwrap_or_else(|| {
-                        // Fallback: check if it's in local_visited values
-                        local_visited
-                            .values()
-                            .find(|&&id| self.buffer_index.get(&id) == Some(&idx))
-                            .copied()
-                            .unwrap_or(0)
-                    })
-            })
-            .collect();
-
-        match op {
-            Operation::Dense {
-                id,
-                output_size,
-                activation,
-            } => {
-                let layer_index = if let Some((_, _, _, idx)) = self.dense_info.get(id) {
-                    *idx
-                } else {
-                    let idx = self.next_dense_index;
-                    self.dense_info
-                        .insert(*id, (input_size, *output_size, *activation, idx));
-                    self.next_dense_index += 1;
-                    idx
-                };
-                self.steps.push(Step::Dense {
-                    layer_index,
-                    input: input_ids[0],
-                    output: new_output_id,
-                });
-            }
-            Operation::Add { .. } => {
-                self.steps.push(Step::Add {
-                    inputs: input_ids,
-                    output: new_output_id,
-                });
-            }
-            Operation::Multiply { .. } => {
-                self.steps.push(Step::Multiply {
-                    inputs: input_ids,
-                    output: new_output_id,
-                });
-            }
-            Operation::Concat { .. } => {
-                self.steps.push(Step::Concat {
-                    inputs: input_ids,
-                    output: new_output_id,
-                });
-            }
-            Operation::Softmax { .. } => {
-                self.steps.push(Step::Softmax {
-                    input: input_ids[0],
-                    output: new_output_id,
-                });
-            }
-            Operation::Scale { vector, .. } => {
-                self.steps.push(Step::Scale {
-                    input: input_ids[0],
-                    output: new_output_id,
-                    vector: vector.clone(),
-                });
-            }
-            Operation::Shift { vector, .. } => {
-                self.steps.push(Step::Shift {
-                    input: input_ids[0],
-                    output: new_output_id,
-                    vector: vector.clone(),
-                });
-            }
-            Operation::BatchNorm {
-                id,
-                epsilon,
-                center,
-                scale,
-                ..
-            } => {
-                let layer_index = if let Some((_, _, _, _, idx)) = self.batch_norm_info.get(id) {
-                    *idx
-                } else {
-                    let idx = self.next_batch_norm_index;
-                    self.batch_norm_info
-                        .insert(*id, (input_size, *epsilon, *center, *scale, idx));
-                    self.next_batch_norm_index += 1;
-                    idx
-                };
-                self.steps.push(Step::BatchNorm {
-                    layer_index,
-                    input: input_ids[0],
-                    output: new_output_id,
-                });
-            }
-            Operation::StandaloneActivation { activation, .. } => {
-                self.steps.push(Step::StandaloneActivation {
-                    input: input_ids[0],
-                    output: new_output_id,
-                    activation: *activation,
-                });
-            }
-        }
-    }
-
-    /// Initialize dense layers and return (layers_vec, op_ids_vec).
-    /// The op_ids_vec maps layer index to OpId for export purposes.
-    fn init_dense_layers<B: Backend>(&self, device: &B::Device) -> (Vec<DenseLayer<B>>, Vec<OpId>) {
-        let mut layers: Vec<(usize, OpId, DenseLayer<B>)> = self
-            .dense_info
-            .iter()
-            .map(
-                |(&op_id, &(input_size, output_size, activation, layer_index))| {
-                    (
-                        layer_index,
-                        op_id,
-                        DenseLayer::new(input_size, output_size, activation, device),
-                    )
-                },
-            )
-            .collect();
-
-        // Sort by layer index to ensure correct ordering
-        layers.sort_by_key(|(idx, _, _)| *idx);
-
-        let op_ids: Vec<OpId> = layers.iter().map(|(_, op_id, _)| *op_id).collect();
-        let dense_layers: Vec<DenseLayer<B>> =
-            layers.into_iter().map(|(_, _, layer)| layer).collect();
-
-        (dense_layers, op_ids)
-    }
-
-    /// Initialize batch norm layers and return (layers_vec, op_ids_vec).
-    fn init_batch_norm_layers<B: Backend>(
-        &self,
-        device: &B::Device,
-    ) -> (Vec<BatchNormLayer<B>>, Vec<OpId>) {
-        let mut layers: Vec<(usize, OpId, BatchNormLayer<B>)> = self
-            .batch_norm_info
-            .iter()
-            .map(
-                |(&op_id, &(num_features, epsilon, center, scale, layer_index))| {
-                    (
-                        layer_index,
-                        op_id,
-                        BatchNormLayer::new(num_features, epsilon, center, scale, device),
-                    )
-                },
-            )
-            .collect();
-
-        // Sort by layer index to ensure correct ordering
-        layers.sort_by_key(|(idx, _, _)| *idx);
-
-        let op_ids: Vec<OpId> = layers.iter().map(|(_, op_id, _)| *op_id).collect();
-        let batch_norm_layers: Vec<BatchNormLayer<B>> =
-            layers.into_iter().map(|(_, _, layer)| layer).collect();
-
-        (batch_norm_layers, op_ids)
     }
 }
 
@@ -1364,619 +539,96 @@ mod tests {
 
     type TestBackend = NdArray;
 
-    #[test]
-    fn test_simple_model() {
-        let device = <TestBackend as Backend>::Device::default();
+    fn compile(input: InputBuffer, output: DataBuffer) -> CompiledModel<TestBackend> {
+        CompiledModel::new(vec![input], output, &Default::default()).unwrap()
+    }
 
-        let input = InputBuffer::new(4);
-        let output = ops::dense(1, Activation::Sigmoid, input.buffer());
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        assert_eq!(model.feature_size(), 4);
-        assert_eq!(model.output_size(), 1);
+    fn run(model: &CompiledModel<TestBackend>, rows: &[[f32; 4]]) -> Tensor<TestBackend, 2> {
+        let data: Vec<f32> = rows.concat();
+        let x = Tensor::<TestBackend, 1>::from_floats(data.as_slice(), &Default::default());
+        model.forward(x.reshape([rows.len(), 4]))
     }
 
     #[test]
-    fn test_multilayer_model() {
-        let device = <TestBackend as Backend>::Device::default();
-
+    fn softmax_forward_and_export() {
         let input = InputBuffer::new(4);
-        let x = ops::dense(8, Activation::Relu, input.buffer());
-        let output = ops::dense(1, Activation::Sigmoid, x);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        assert_eq!(model.feature_size(), 4);
-        assert_eq!(model.output_size(), 1);
+        let output = ops::softmax(ops::dense(3, Activation::None, input.buffer()));
+        let model = compile(input, output);
+        let out: Vec<f32> = run(&model, &[[1.0, 2.0, 3.0, 4.0]])
+            .to_data()
+            .to_vec()
+            .unwrap();
+        assert!((out.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        let json = model.export_to_instruction_model().unwrap();
+        assert!(json.contains("\"activation\": \"SOFTMAX\""));
+        assert_eq!(
+            model.to_instruction_model_info().buffer_sizes,
+            vec![4, 3, 3]
+        );
     }
 
     #[test]
-    fn test_forward_pass() {
-        let device = <TestBackend as Backend>::Device::default();
+    fn batch_norm_initial_state() {
+        let device = Default::default();
+        let eps = 1e-3f32;
+        let layer = BatchNormLayer::<TestBackend>::new(4, eps, true, true, &device);
+        let (center, std, beta) = layer.normalization_params();
+        let s = 1.0 / (1.0 + eps).sqrt();
+        assert_eq!((center, beta), (vec![0.0; 4], vec![0.0; 4]));
+        assert!(std.iter().all(|v| (v - s).abs() < 1e-6));
 
+        let x = Tensor::<TestBackend, 2>::from_floats([[1.0, -2.0, 0.0, 4.0]], &device);
+        let out: Vec<f32> = layer.forward(x).to_data().to_vec().unwrap();
+        for (o, e) in out.iter().zip([1.0, -2.0, 0.0, 4.0]) {
+            assert!((o - e * s).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn shared_batch_norm_exports_one_parameter_set() {
+        let input = InputBuffer::new(4);
+        let bn = Operation::batch_norm_default();
+        let x = input.buffer();
+        let merged = ops::add(vec![bn.apply(x.clone()), bn.apply(x)]);
+        let model = compile(input, ops::dense(2, Activation::None, merged));
+        assert_eq!(model.batch_norm_layers.len(), 1);
+        assert_eq!(run(&model, &[[1.0; 4], [2.0; 4], [3.0; 4]]).dims(), [3, 2]);
+        assert_eq!(model.to_instruction_model_info().parameters.len(), 3);
+    }
+
+    #[test]
+    fn unregistered_input_is_an_error() {
         let input = InputBuffer::new(2);
-        let output = ops::dense(1, Activation::None, input.buffer());
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-
-        assert_eq!(output_tensor.dims(), [1, 1]);
+        let stray = InputBuffer::new(2);
+        let output = ops::add(vec![input.buffer(), stray.buffer()]);
+        let err = CompiledModel::<TestBackend>::new(vec![input], output, &Default::default());
+        assert!(matches!(err, Err(ModelError::InvalidGraph(_))));
     }
 
     #[test]
-    fn test_add_operation() {
-        let device = <TestBackend as Backend>::Device::default();
+    fn submodel_of_graph_applied_twice() {
+        let sub_input = InputBuffer::new(4);
+        let sub_out = ops::dense(4, Activation::Tanh, ops::batch_norm(sub_input.buffer()));
+        let sub = ModelGraph::new(vec![sub_input], sub_out);
 
         let input = InputBuffer::new(4);
-        let x = input.buffer();
+        let once = sub.apply_single(input.buffer());
+        let twice = sub.apply_single(once.clone());
+        let model = compile(input, ops::concat(vec![once, twice]));
+        let submodel = model.submodel(&sub);
 
-        let branch1 = ops::dense(4, Activation::Relu, x.clone());
-        let branch2 = ops::dense(4, Activation::Relu, x);
-
-        let added = ops::add(vec![branch1, branch2]);
-        let output = ops::dense(1, Activation::Sigmoid, added);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
+        let x = [[0.5, -1.0, 2.0, 0.0]];
+        let full: Vec<f32> = run(&model, &x).to_data().to_vec().unwrap();
+        let first: Vec<f32> = submodel
+            .forward(Tensor::from_floats(x, &Default::default()))
+            .to_data()
+            .to_vec()
+            .unwrap();
+        assert_eq!(&full[..4], first.as_slice());
     }
 
-    #[test]
-    fn test_multiply_operation() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-
-        let branch1 = ops::dense(4, Activation::Relu, x.clone());
-        let branch2 = ops::dense(4, Activation::Relu, x);
-
-        let multiplied = ops::multiply(vec![branch1, branch2]);
-        let output = ops::dense(1, Activation::Sigmoid, multiplied);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-    }
-
-    #[test]
-    fn test_export() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-
-        let branch1 = ops::dense(4, Activation::Relu, x.clone());
-        let branch2 = ops::dense(4, Activation::Relu, x);
-
-        let added = ops::add(vec![branch1, branch2]);
-        let output = ops::dense(1, Activation::Sigmoid, added);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let export = model.to_instruction_model_info();
-
-        assert_eq!(export.instructions.len(), 4);
-    }
-
-    #[test]
-    fn test_concat_operation() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-
-        let branch1 = ops::dense(3, Activation::Relu, x.clone());
-        let branch2 = ops::dense(2, Activation::Relu, x);
-
-        let concatenated = ops::concat(vec![branch1, branch2]);
-        let output = ops::dense(1, Activation::Sigmoid, concatenated);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        assert_eq!(model.output_size(), 1);
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-    }
-
-    #[test]
-    fn test_softmax_operation() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = ops::dense(3, Activation::None, input.buffer());
-        let output = ops::softmax(x);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        assert_eq!(model.output_size(), 3);
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 3]);
-
-        let output_data: Vec<f32> = output_tensor.to_data().to_vec().unwrap();
-        let sum: f32 = output_data.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "Softmax output should sum to 1");
-    }
-
-    #[test]
-    fn test_concat_export() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-
-        let branch1 = ops::dense(3, Activation::Relu, x.clone());
-        let branch2 = ops::dense(2, Activation::Relu, x);
-
-        let concatenated = ops::concat(vec![branch1, branch2]);
-        let output = ops::dense(1, Activation::Sigmoid, concatenated);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let export = model.to_instruction_model_info();
-
-        assert_eq!(export.buffer_sizes[3], 5);
-    }
-
-    #[test]
-    fn test_softmax_export() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = ops::dense(3, Activation::None, input.buffer());
-        let output = ops::softmax(x);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let json = model
-            .export_to_instruction_model()
-            .expect("Serialization failed");
-        assert!(json.contains("ACTIVATION"));
-        assert!(json.contains("SOFTMAX"));
-    }
-
-    #[test]
-    fn test_scale_operation() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let scaled = ops::scale(vec![2.0, 3.0, 4.0, 5.0], x);
-        let output = ops::dense(1, Activation::Sigmoid, scaled);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-    }
-
-    #[test]
-    fn test_shift_operation() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let shifted = ops::shift(vec![0.1, 0.2, 0.3, 0.4], x);
-        let output = ops::dense(1, Activation::Sigmoid, shifted);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-    }
-
-    #[test]
-    fn test_scale_shift_combined() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let scaled = ops::scale(vec![2.0, 2.0, 2.0, 2.0], x);
-        let shifted = ops::shift(vec![1.0, 1.0, 1.0, 1.0], scaled);
-        let output = ops::dense(1, Activation::Sigmoid, shifted);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-    }
-
-    #[test]
-    fn test_scale_export() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let scaled = ops::scale(vec![2.0, 3.0, 4.0, 5.0], x);
-        let output = ops::dense(1, Activation::Sigmoid, scaled);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let json = model
-            .export_to_instruction_model()
-            .expect("Serialization failed");
-        assert!(json.contains("MUL_ELEMENTWISE"));
-        assert!(json.contains("parameters"));
-    }
-
-    #[test]
-    fn test_shift_export() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let shifted = ops::shift(vec![0.1, 0.2, 0.3, 0.4], x);
-        let output = ops::dense(1, Activation::Sigmoid, shifted);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let json = model
-            .export_to_instruction_model()
-            .expect("Serialization failed");
-        assert!(json.contains("ADD_ELEMENTWISE"));
-        assert!(json.contains("parameters"));
-    }
-
-    #[test]
-    fn test_batch_norm_operation() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let normalized = ops::batch_norm(x);
-        let output = ops::dense(1, Activation::Sigmoid, normalized);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-    }
-
-    #[test]
-    fn test_batch_norm_with_dense() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let hidden = ops::dense(8, Activation::Relu, x);
-        let normalized = ops::batch_norm(hidden);
-        let output = ops::dense(1, Activation::Sigmoid, normalized);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-    }
-
-    #[test]
-    fn test_batch_norm_export() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let normalized = ops::batch_norm(x);
-        let output = ops::dense(1, Activation::Sigmoid, normalized);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let json = model
-            .export_to_instruction_model()
-            .expect("Serialization failed");
-
-        // BatchNorm should export as: COPY + ADD_ELEMENTWISE + MUL_ELEMENTWISE + ADD_ELEMENTWISE
-        assert!(json.contains("ADD_ELEMENTWISE"));
-        assert!(json.contains("MUL_ELEMENTWISE"));
-        assert!(json.contains("parameters"));
-    }
-
-    #[test]
-    fn test_batch_norm_layer_params_computation() {
-        use super::BatchNormLayer;
-
-        let device = <TestBackend as Backend>::Device::default();
-        let epsilon = 1e-3f32;
-        let layer = BatchNormLayer::<TestBackend>::new(4, epsilon, true, true, &device);
-
-        let (center, std, beta) = layer.get_normalization_params();
-
-        // Initial state: gamma=1, beta=0, running_mean=0, running_var=1
-        // center = -running_mean = -0 = 0
-        // std = gamma / sqrt(var + eps) = 1 / sqrt(1 + 0.001) ≈ 0.9995
-        // beta = 0
-
-        assert_eq!(center.len(), 4);
-        assert_eq!(std.len(), 4);
-        assert_eq!(beta.len(), 4);
-
-        for i in 0..4 {
-            assert!(
-                center[i].abs() < 1e-5,
-                "center[{}] should be ~0, got {}",
-                i,
-                center[i]
-            );
-            let expected_std = 1.0 / (1.0 + epsilon).sqrt();
-            assert!(
-                (std[i] - expected_std).abs() < 1e-5,
-                "std[{}] should be ~{}, got {}",
-                i,
-                expected_std,
-                std[i]
-            );
-            assert!(
-                beta[i].abs() < 1e-5,
-                "beta[{}] should be ~0, got {}",
-                i,
-                beta[i]
-            );
-        }
-    }
-
-    #[test]
-    fn test_batch_norm_forward_initial_state() {
-        use super::BatchNormLayer;
-
-        let device = <TestBackend as Backend>::Device::default();
-        let epsilon = 1e-3f32;
-        let layer = BatchNormLayer::<TestBackend>::new(4, epsilon, true, true, &device);
-
-        // With initial state (gamma=1, beta=0, mean=0, var=1):
-        // output = gamma * (x - mean) / sqrt(var + eps) + beta
-        // output = 1 * (x - 0) / sqrt(1 + 0.001) + 0
-        // output ≈ x * 0.9995
-
-        let input = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output = layer.forward(input);
-        let output_data: Vec<f32> = output.to_data().to_vec().unwrap();
-
-        let expected_scale = 1.0 / (1.0 + epsilon).sqrt();
-        let expected = [
-            1.0 * expected_scale,
-            2.0 * expected_scale,
-            3.0 * expected_scale,
-            4.0 * expected_scale,
-        ];
-
-        for i in 0..4 {
-            assert!(
-                (output_data[i] - expected[i]).abs() < 1e-4,
-                "output[{}] should be ~{}, got {}",
-                i,
-                expected[i],
-                output_data[i]
-            );
-        }
-    }
-
-    #[test]
-    fn test_batch_norm_export_has_three_parameter_vectors() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let normalized = ops::batch_norm(x);
-        let output = ops::dense(1, Activation::Sigmoid, normalized);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let export = model.to_instruction_model_info();
-
-        // BatchNorm should create 3 parameter vectors (center, std, beta)
-        assert!(
-            export.parameters.len() >= 3,
-            "Expected at least 3 parameter vectors for BatchNorm, got {}",
-            export.parameters.len()
-        );
-
-        // Each parameter vector should have 4 elements (matching input size)
-        for (i, params) in export.parameters.iter().take(3).enumerate() {
-            assert_eq!(
-                params.len(),
-                4,
-                "Parameter vector {} should have 4 elements, got {}",
-                i,
-                params.len()
-            );
-        }
-    }
-
-    #[test]
-    fn test_batch_norm_export_instructions_order() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let normalized = ops::batch_norm(x);
-        let output = ops::dense(1, Activation::Sigmoid, normalized);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        let json = model
-            .export_to_instruction_model()
-            .expect("Serialization failed");
-
-        // Verify instruction order: COPY, ADD_ELEMENTWISE, MUL_ELEMENTWISE, ADD_ELEMENTWISE, DOT
-        let copy_pos = json.find("COPY").expect("Should have COPY");
-        let first_add_pos = json
-            .find("ADD_ELEMENTWISE")
-            .expect("Should have ADD_ELEMENTWISE");
-        let mul_pos = json
-            .find("MUL_ELEMENTWISE")
-            .expect("Should have MUL_ELEMENTWISE");
-        let dot_pos = json.find("DOT").expect("Should have DOT");
-
-        assert!(
-            copy_pos < first_add_pos,
-            "COPY should come before ADD_ELEMENTWISE"
-        );
-        assert!(
-            first_add_pos < mul_pos,
-            "First ADD_ELEMENTWISE should come before MUL_ELEMENTWISE"
-        );
-        assert!(mul_pos < dot_pos, "MUL_ELEMENTWISE should come before DOT");
-    }
-
-    #[test]
-    fn test_batch_norm_sharing() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-
-        // Create a shared BatchNorm operation
-        let shared_bn = super::super::operation::Operation::batch_norm_default();
-
-        // Apply same BatchNorm to two branches
-        let branch1 = shared_bn.apply(x.clone());
-        let branch2 = shared_bn.apply(x);
-
-        // Merge and output
-        let merged = ops::add(vec![branch1, branch2]);
-        let output = ops::dense(1, Activation::Sigmoid, merged);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        // Forward pass should work
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-
-        // Both branches should use the same BatchNorm layer (same op_id)
-        // This is verified by the model building without error
-    }
-
-    #[test]
-    fn test_batch_norm_different_epsilons() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        // Test with different epsilon values
-        for epsilon in [1e-5, 1e-3, 1e-1] {
-            let input = InputBuffer::new(4);
-            let x = input.buffer();
-            let normalized = ops::batch_norm_with_epsilon(epsilon, x);
-            let output = ops::dense(1, Activation::Sigmoid, normalized);
-
-            let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-                .expect("Model creation should succeed");
-
-            let input_tensor =
-                Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-            let output_tensor = model.forward(input_tensor);
-            assert_eq!(output_tensor.dims(), [1, 1]);
-        }
-    }
-
-    #[test]
-    fn test_batch_norm_preserves_batch_dimension() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let normalized = ops::batch_norm(x);
-        let output = ops::dense(2, Activation::None, normalized);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        // Test with batch size > 1
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats(
-            [
-                [1.0, 2.0, 3.0, 4.0],
-                [5.0, 6.0, 7.0, 8.0],
-                [9.0, 10.0, 11.0, 12.0],
-            ],
-            &device,
-        );
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [3, 2]);
-    }
-
-    #[test]
-    fn test_batch_norm_with_negative_inputs() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let normalized = ops::batch_norm(x);
-        let output = ops::dense(1, Activation::None, normalized);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        // Test with negative values
-        let input_tensor =
-            Tensor::<TestBackend, 2>::from_floats([[-1.0, -2.0, 3.0, -4.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-
-        // Output should be a valid number (not NaN or Inf)
-        let output_data: Vec<f32> = output_tensor.to_data().to_vec().unwrap();
-        assert!(output_data[0].is_finite(), "Output should be finite");
-    }
-
-    #[test]
-    fn test_batch_norm_with_zero_inputs() {
-        let device = <TestBackend as Backend>::Device::default();
-
-        let input = InputBuffer::new(4);
-        let x = input.buffer();
-        let normalized = ops::batch_norm(x);
-        let output = ops::dense(1, Activation::None, normalized);
-
-        let model = CompiledModel::<TestBackend>::new(vec![input], output, &device)
-            .expect("Model creation should succeed");
-
-        // Test with all zeros
-        let input_tensor = Tensor::<TestBackend, 2>::from_floats([[0.0, 0.0, 0.0, 0.0]], &device);
-        let output_tensor = model.forward(input_tensor);
-        assert_eq!(output_tensor.dims(), [1, 1]);
-
-        // Output should be a valid number
-        let output_data: Vec<f32> = output_tensor.to_data().to_vec().unwrap();
-        assert!(output_data[0].is_finite(), "Output should be finite");
-    }
-
-    // Training tests with Autodiff backend
-    mod training_tests {
+    mod training {
         use super::*;
-        use crate::graph::Operation;
         use burn::backend::Autodiff;
         use burn::optim::{AdamConfig, GradientsParams, Optimizer};
         use burn::tensor::ElementConversion;
@@ -1984,249 +636,39 @@ mod tests {
         type TrainingBackend = Autodiff<NdArray>;
 
         #[test]
-        fn test_graph_model_is_trainable() {
-            let device = <TrainingBackend as Backend>::Device::default();
-
-            // Simple model: input -> hidden -> output
+        fn shared_dense_model_learns() {
+            let device = Default::default();
             let input = InputBuffer::new(4);
             let x = input.buffer();
-            let hidden = ops::dense(8, Activation::Relu, x);
-            let output = ops::dense(1, Activation::Sigmoid, hidden);
-
-            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
-                .expect("Model creation should succeed");
-
-            let mut optimizer = AdamConfig::new().init();
-
-            // Create dummy data
-            let input_tensor =
-                Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-            let target = Tensor::<TrainingBackend, 2>::from_floats([[0.5]], &device);
-
-            // Forward pass
-            let output_tensor = model.forward(input_tensor);
-
-            // Compute loss (MSE)
-            let diff = output_tensor.sub(target);
-            let loss = diff.clone().mul(diff).mean();
-            let initial_loss: f32 = loss.clone().into_scalar().elem();
-
-            // Backward pass
-            let grads = loss.backward();
-            let grads_params = GradientsParams::from_grads(grads, &model);
-
-            // Update model
-            model = optimizer.step(0.01, model, grads_params);
-
-            // Verify model was updated (loss should change after parameter update)
-            let input_tensor2 =
-                Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-            let target2 = Tensor::<TrainingBackend, 2>::from_floats([[0.5]], &device);
-            let output_tensor2 = model.forward(input_tensor2);
-            let diff2 = output_tensor2.sub(target2);
-            let loss2 = diff2.clone().mul(diff2).mean();
-            let new_loss: f32 = loss2.into_scalar().elem();
-
-            // The losses should be different (model was updated)
-            assert!(
-                (initial_loss - new_loss).abs() > 1e-10,
-                "Model parameters should have been updated"
-            );
-        }
-
-        #[test]
-        fn test_fan_out_concat_training() {
-            let device = <TrainingBackend as Backend>::Device::default();
-
-            // Fan-out pattern: input -> two branches -> concat -> output
-            let input = InputBuffer::new(4);
-            let x = input.buffer();
-
-            let branch1 = ops::dense(3, Activation::Relu, x.clone());
-            let branch2 = ops::dense(2, Activation::Relu, x);
-
-            let concatenated = ops::concat(vec![branch1, branch2]);
-            let output = ops::dense(1, Activation::Sigmoid, concatenated);
-
-            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
-                .expect("Model creation should succeed");
+            let shared = Operation::dense(4, Activation::Relu);
+            let scaled = ops::scale(vec![2.0; 4], x.clone());
+            let joined = ops::concat(vec![shared.apply(x), shared.apply(scaled)]);
+            let output = ops::dense(1, Activation::None, joined);
+            let mut model =
+                CompiledModel::<TrainingBackend>::new(vec![input], output, &device).unwrap();
+            assert_eq!(model.dense_layers.len(), 2);
 
             let mut optimizer = AdamConfig::new().init();
-
-            // Training loop
-            let mut losses = Vec::new();
-            for _ in 0..5 {
-                let input_tensor =
-                    Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-                let target = Tensor::<TrainingBackend, 2>::from_floats([[0.7]], &device);
-
-                let output_tensor = model.forward(input_tensor);
-                let diff = output_tensor.sub(target);
-                let loss = diff.clone().mul(diff).mean();
-
-                losses.push(loss.clone().into_scalar().elem::<f32>());
-
-                let grads = loss.backward();
-                let grads_params = GradientsParams::from_grads(grads, &model);
-                model = optimizer.step(0.01, model, grads_params);
-            }
-
-            // Loss should generally decrease over training
-            assert!(
-                losses[4] < losses[0] * 1.5,
-                "Loss should not increase dramatically during training"
-            );
-        }
-
-        #[test]
-        fn test_fan_in_add_training() {
-            let device = <TrainingBackend as Backend>::Device::default();
-
-            // Fan-in pattern: input -> two branches -> add -> output (residual-like)
-            let input = InputBuffer::new(4);
-            let x = input.buffer();
-
-            let branch1 = ops::dense(4, Activation::Relu, x.clone());
-            let branch2 = ops::dense(4, Activation::Relu, x);
-
-            let added = ops::add(vec![branch1, branch2]);
-            let output = ops::dense(1, Activation::Sigmoid, added);
-
-            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
-                .expect("Model creation should succeed");
-
-            let mut optimizer = AdamConfig::new().init();
-
-            // Single training step should work
-            let input_tensor =
-                Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-            let target = Tensor::<TrainingBackend, 2>::from_floats([[0.3]], &device);
-
-            let output_tensor = model.forward(input_tensor);
-            let diff = output_tensor.sub(target);
-            let loss = diff.clone().mul(diff).mean();
-
-            let grads = loss.backward();
-            let grads_params = GradientsParams::from_grads(grads, &model);
-            model = optimizer.step(0.01, model, grads_params);
-
-            // Verify model still works after update
-            let input_tensor2 =
-                Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-            let output_tensor2 = model.forward(input_tensor2);
-            let output_data: Vec<f32> = output_tensor2.into_data().to_vec().unwrap();
-            assert!(
-                output_data[0].is_finite(),
-                "Output should be finite after training"
-            );
-        }
-
-        #[test]
-        fn test_shared_layer_training() {
-            let device = <TrainingBackend as Backend>::Device::default();
-
-            // Shared layer pattern: same dense applied to different transformations
-            let input = InputBuffer::new(4);
-            let x = input.buffer();
-
-            // Create a shared dense operation
-            let shared_dense = Operation::dense(4, Activation::Relu);
-
-            // Apply to two different paths
-            let path1 = shared_dense.apply(x.clone());
-            let scaled_x = ops::scale(vec![2.0, 2.0, 2.0, 2.0], x);
-            let path2 = shared_dense.apply(scaled_x);
-
-            let concatenated = ops::concat(vec![path1, path2]);
-            let output = ops::dense(1, Activation::Sigmoid, concatenated);
-
-            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
-                .expect("Model creation should succeed");
-
-            let mut optimizer = AdamConfig::new().init();
-
-            // Training step
-            let input_tensor =
-                Tensor::<TrainingBackend, 2>::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
-            let target = Tensor::<TrainingBackend, 2>::from_floats([[0.5]], &device);
-
-            let output_tensor = model.forward(input_tensor);
-            let diff = output_tensor.sub(target);
-            let loss = diff.clone().mul(diff).mean();
-
-            let grads = loss.backward();
-            let grads_params = GradientsParams::from_grads(grads, &model);
-            model = optimizer.step(0.01, model, grads_params);
-
-            // Model should still work
-            let input_tensor2 =
-                Tensor::<TrainingBackend, 2>::from_floats([[0.5, 1.0, 1.5, 2.0]], &device);
-            let output_tensor2 = model.forward(input_tensor2);
-            assert_eq!(output_tensor2.dims(), [1, 1]);
-        }
-
-        #[test]
-        fn test_training_loss_decreases() {
-            let device = <TrainingBackend as Backend>::Device::default();
-
-            // Model to learn: output = mean(input) approximately
-            let input = InputBuffer::new(4);
-            let x = input.buffer();
-            let hidden = ops::dense(8, Activation::Relu, x);
-            let output = ops::dense(1, Activation::None, hidden);
-
-            let mut model = CompiledModel::<TrainingBackend>::new(vec![input], output, &device)
-                .expect("Model creation should succeed");
-
-            let mut optimizer = AdamConfig::new().init();
-
-            // Training data: input -> mean
-            let training_data = vec![
+            let data = [
                 ([1.0f32, 2.0, 3.0, 4.0], 2.5f32),
-                ([0.0, 0.0, 0.0, 0.0], 0.0),
-                ([4.0, 4.0, 4.0, 4.0], 4.0),
+                ([0.0; 4], 0.0),
+                ([4.0; 4], 4.0),
                 ([-1.0, 1.0, -1.0, 1.0], 0.0),
             ];
-
-            let mut initial_total_loss = 0.0f32;
-            let mut final_total_loss = 0.0f32;
-
-            // Multiple epochs
-            for epoch in 0..20 {
-                let mut epoch_loss = 0.0f32;
-
-                for (input_data, target_val) in &training_data {
-                    let input_tensor =
-                        Tensor::<TrainingBackend, 2>::from_floats([*input_data], &device);
-                    let target =
-                        Tensor::<TrainingBackend, 2>::from_floats([[*target_val]], &device);
-
-                    let output_tensor = model.forward(input_tensor);
-                    let diff = output_tensor.sub(target);
-                    let loss = diff.clone().mul(diff).mean();
-
-                    epoch_loss += loss.clone().into_scalar().elem::<f32>();
-
-                    let grads = loss.backward();
-                    let grads_params = GradientsParams::from_grads(grads, &model);
-                    model = optimizer.step(0.01, model, grads_params);
+            let mut epoch_losses = Vec::new();
+            for _ in 0..20 {
+                let mut total = 0.0;
+                for (x, y) in &data {
+                    let pred = model.forward(Tensor::from_floats([*x], &device));
+                    let diff = pred - Tensor::from_floats([[*y]], &device);
+                    let loss = (diff.clone() * diff).mean();
+                    total += loss.clone().into_scalar().elem::<f32>();
+                    let grads = GradientsParams::from_grads(loss.backward(), &model);
+                    model = optimizer.step(0.01, model, grads);
                 }
-
-                if epoch == 0 {
-                    initial_total_loss = epoch_loss;
-                }
-                if epoch == 19 {
-                    final_total_loss = epoch_loss;
-                }
+                epoch_losses.push(total);
             }
-
-            // Loss should decrease significantly
-            assert!(
-                final_total_loss < initial_total_loss,
-                "Loss should decrease: initial={}, final={}",
-                initial_total_loss,
-                final_total_loss
-            );
+            assert!(epoch_losses[19] < epoch_losses[0], "{epoch_losses:?}");
         }
     }
 }
