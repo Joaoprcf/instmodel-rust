@@ -625,6 +625,24 @@ fn export_layouts_and_values() {
             vec![11.0, 22.0, 33.0],
         ),
         (
+            "identity activation copied",
+            graph(2, |x| ops::activation(A::None, x)),
+            vec![2, 2],
+            vec![copy(0, 1, 0)],
+            vec![-1.0, 2.0],
+            vec![-1.0, 2.0],
+        ),
+        (
+            "identity activation in place",
+            graph(2, |x| {
+                ops::activation_inplace(A::None, ops::scale_inplace(vec![2.0, 3.0], x))
+            }),
+            vec![2],
+            vec![mul_p(0, 0)],
+            vec![-1.0, 2.0],
+            vec![-2.0, 6.0],
+        ),
+        (
             "mixed in-place chain",
             graph(4, |x| {
                 let x = ops::shift_inplace(vec![0.5; 4], ops::scale(vec![1.0, 2.0, 3.0, 4.0], x));

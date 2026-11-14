@@ -274,13 +274,13 @@ impl Operation {
                 ..
             } => {
                 let target = copy_target(ctx, input, ctx.buffer_sizes[input], *in_place);
-                ctx.add_instruction(InstructionExport::Activation {
-                    input: target,
-                    activation: activation
-                        .to_instruction_name()
-                        .unwrap_or("NONE")
-                        .to_string(),
-                });
+                // Identity emits nothing: inference engines reject "NONE".
+                if let Some(name) = activation.to_instruction_name() {
+                    ctx.add_instruction(InstructionExport::Activation {
+                        input: target,
+                        activation: name.to_string(),
+                    });
+                }
                 target
             }
         }
